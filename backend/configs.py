@@ -42,7 +42,7 @@ class CostEventBatch(BaseModel):
 class ThresholdIn(BaseModel):
     tenant_id: str
     limit_usd: float = Field(gt=0)
-
+    project_id: str
 
 class StripeWebhookPayload(BaseModel):
     id: str

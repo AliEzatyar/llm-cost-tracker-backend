@@ -88,7 +88,7 @@ class UserProfile(BaseModel):
     is_verified: bool
     created_at: str
     last_login: str | None
-
+    is_admin: bool
     model_config = {"from_attributes": True}
 
 
@@ -261,7 +261,9 @@ async def logout(
 @router.get("/me", response_model=UserProfile)
 async def me(current_user: User = Depends(get_current_user)):
     """Return the authenticated user's profile."""
+    
     return UserProfile(
+        is_admin=current_user.is_admin,
         id=str(current_user.id),
         email=current_user.email,
         is_verified=current_user.is_verified,

@@ -61,7 +61,6 @@ class CostService:
         date_to: date | None = None,
     ) -> list[dict]:
         """Return daily rollup rows for all customers in this project.
-
         Joins cost_events to include total token counts (input + output)
         per customer per day, which are not stored in customer_cost_daily.
         """

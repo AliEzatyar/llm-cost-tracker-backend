@@ -10,18 +10,12 @@ Run:
 """
 
 from .database.models import (
-    User,
-    Project,
     get_project_by_api_key,
-    get_project_by_owner_id,
 )
 import logging
-import os
-from typing import Any
 from dotenv import load_dotenv
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from .auth.routers import router as auth_router
@@ -29,9 +23,11 @@ from .auth.services import ALGORITHM, SECRET_KEY
 from jose import jwt, JWTError
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from .database.database import AsyncSessionLocal, create_all_tables, drop_all_tables
+from .database.database import AsyncSessionLocal
 from backend.dashboard.routers import router as dashboard_router
 from .configs import limiter
+from .sdk_api.routers import router as sdk_api_router
+from backend.admin.routers import router as admin_router
 
 load_dotenv()
 
@@ -55,6 +51,8 @@ app.add_middleware(
 )
 app.include_router(auth_router)
 app.include_router(dashboard_router)
+app.include_router(sdk_api_router)
+app.include_router(admin_router)
 
 # ---- Auth middleware --------------------------------------------------------
 
@@ -112,18 +110,6 @@ async def auth_middleware(request: Request, call_next):
             user_id = payload.get("sub")
             if not user_id:
                 raise JWTError("Missing sub claim")
-            # ------------- setting project object to user ---------------
-            if not (request.url.path in NO_PROJECT_NEEDED_PATHS):
-                async with AsyncSessionLocal() as session:
-                    project = await get_project_by_owner_id(session, user_id)
-                    if not project:
-                        return JSONResponse(
-                            content={"detail": "invalid user id"}, status_code=404
-                        )
-
-                    request.state.project = project
-                    request.state.project_id = str(project["id"])
-
             request.state.auth_type = "jwt"
             request.state.user_id = user_id
             request.state.jwt_payload = payload
@@ -151,6 +137,10 @@ async def auth_middleware(request: Request, call_next):
 
 
 # ---- Startup ---------------------------------------------------------------
+
+# backend/database/seed.py
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
 
 
 @app.on_event("startup")

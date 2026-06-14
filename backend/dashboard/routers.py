@@ -19,11 +19,9 @@ from backend.dashboard.services import (
     _verify_stripe_signature,
 )
 from backend.database.database import get_db
-from backend.database.models import Project, User, get_project_by_api_key
+from backend.database.models import Alert, Project, Threshold, User, get_project_by_api_key
 from backend.configs import (
     STRIPE_WEBHOOK_SECRET,
-    CostEventBatch,
-    CostEventIn,
     ThresholdIn,
 )
 from backend.configs import limiter
@@ -42,48 +40,6 @@ def _require_user(request: Request) -> str:
     return user_id
 
 
-def _require_project(request: Request) -> str:
-    """Return project_id from request.state or raise 401.
-
-    The auth middleware is responsible for resolving the Bearer token to a
-    user and a project_id. Dashboard routes rely on this — no raw API key
-    is ever read from request headers inside these routes.
-    """
-    project_id = getattr(request.state, "project_id", None)
-    if not project_id:
-        raise HTTPException(
-            status_code=404,
-            detail="No project resolved from token. Ensure Authorization: Bearer <token> is set.",
-        )
-    return project_id
-
-
-# ── POST /ingest ─────────────────────────────────────────────────────────────
-# NOTE: This endpoint is intended for SDK use only (via API key), not the
-# dashboard UI. It is kept here for completeness but the dashboard never
-# calls it.
-
-
-@router.post("/ingest", status_code=202, tags=["costs"])
-@limiter.limit("1000/minute")
-async def ingest_cost_event(
-    request: Request,
-    events: CostEventBatch,
-    db: AsyncSession = Depends(get_db),
-):
-    """Receive a single SDK cost event and persist it (SDK use only)."""
-    project_id = request.state.project_id
-    billing = BillingService(db)
-    await billing.enforce_limit(project_id)
-    cost_svc = CostService(db)
-    counter = 0
-    for ev in events.events:
-        cost_usd = 1000
-        await cost_svc.write_event(project_id, ev,cost_usd)
-        counter += 1
-    return counter
-
-
 # ── GET /costs ────────────────────────────────────────────────────────────────
 
 
@@ -91,15 +47,14 @@ async def ingest_cost_event(
 @limiter.limit("1000/minute")
 async def list_costs(
     request: Request,
+    project_id: uuid.UUID,
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
 ):
     """Return daily cost rollup for all customers in the authenticated project."""
-    project_id: str = _require_project(request)
     cost_svc = CostService(db)
     rows = await cost_svc.get_by_tenant(project_id, date_from, date_to)
-    print("costs found", rows)
     return {"project_id": project_id, "rows": rows, "count": len(rows)}
 
 
@@ -112,15 +67,14 @@ async def list_costs(
 @limiter.limit("60/minute")
 async def export_costs_csv(
     request: Request,
+    project_id: uuid.UUID,
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
 ):
     """Download cost rollup as a CSV file. Authenticated via Bearer token."""
-    project_id: str = _require_project(request)
     cost_svc = CostService(db)
     rows = await cost_svc.get_by_tenant(project_id, date_from, date_to)
-
     buf = io.StringIO()
     writer = csv.DictWriter(
         buf, fieldnames=["tenant_id", "date", "total_cost_usd", "total_calls"]
@@ -153,12 +107,12 @@ async def export_costs_csv(
 async def get_customer_costs(
     request: Request,
     tenant_id: str,
+    project_id: uuid.UUID,
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
 ):
     """Return per-model cost breakdown for a single customer."""
-    project_id: str = _require_project(request)
     cost_svc = CostService(db)
     return await cost_svc.get_customer_breakdown(
         project_id, tenant_id, date_from, date_to
@@ -176,7 +130,7 @@ async def set_threshold(
     db: AsyncSession = Depends(get_db),
 ):
     """Create or update a monthly spend threshold for a customer."""
-    project_id: str = _require_project(request)
+
     threshold_id = str(uuid.uuid4())
 
     await db.execute(
@@ -188,16 +142,131 @@ async def set_threshold(
         """),
         {
             "id": threshold_id,
-            "project_id": project_id,
+            "project_id": body.project_id,
             "tenant_id": body.tenant_id,
             "limit_usd": body.limit_usd,
         },
     )
     return {
-        "project_id": project_id,
+        "project_id": body.project_id,
         "tenant_id": body.tenant_id,
         "limit_usd": body.limit_usd,
     }
+
+from fastapi import APIRouter, Depends, Query, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import select
+
+
+@router.get("/thresholds", tags=["alerts"])
+@limiter.limit("1000/minute")
+async def list_thresholds(
+    request: Request,
+    project_id: uuid.UUID = Query(...),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if project.owner_id != user.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    result = await db.execute(
+        select(Threshold).where(Threshold.project_id == project_id)
+    )
+    rows = result.scalars().all()
+
+    return [
+        {
+            "id": t.id,
+            "tenant_id": t.tenant_id,
+            "limit_usd": float(t.limit_usd),
+        }
+        for t in rows
+    ]
+
+# ── PUT /thresholds/{threshold_id} ────────────────────────────────────────────
+
+
+class UpdateThresholdRequest(BaseModel):
+    limit_usd: float = Field(..., gt=0)
+
+
+@router.put("/thresholds/{threshold_id}", tags=["alerts"])
+@limiter.limit("1000/minute")
+async def update_threshold(
+    request: Request,
+    threshold_id: str,
+    body: UpdateThresholdRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Update the spend limit for an existing threshold."""
+    result = await db.execute(
+        select(Threshold)
+        .join(Project, Project.id == Threshold.project_id)
+        .where(
+            Threshold.id == threshold_id,
+            Project.owner_id == user.id,
+        )
+    )
+    threshold = result.scalar_one_or_none()
+
+    if not threshold:
+        raise HTTPException(status_code=404, detail="Threshold not found")
+
+    threshold.limit_usd = body.limit_usd
+    threshold.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(threshold)
+
+    return {
+        "id": threshold.id,
+        "project_id": threshold.project_id,
+        "tenant_id": threshold.tenant_id,
+        "limit_usd": float(threshold.limit_usd),
+    }
+
+
+# ── DELETE /thresholds/{threshold_id} ────────────────────────────────────────
+
+
+@router.delete("/thresholds/{threshold_id}", status_code=204, tags=["alerts"])
+@limiter.limit("1000/minute")
+async def delete_threshold(
+    request: Request,
+    threshold_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Delete a threshold. Only the project owner can delete it."""
+    result = await db.execute(
+        select(Threshold)
+        .join(Project, Project.id == Threshold.project_id)
+        .where(
+            Threshold.id == threshold_id,
+            Project.owner_id == user.id,
+        )
+    )
+    threshold = result.scalar_one_or_none()
+
+    if not threshold:
+        raise HTTPException(status_code=404, detail="Threshold not found")
+    # related alerts
+    result = await db.execute(
+        select(Alert)
+        .join(Project, Project.id == Threshold.project_id)
+        .where(
+            Threshold.id == threshold_id,
+            Project.owner_id == user.id,
+        )
+    )
+    await db.delete(threshold)
+    await db.commit()
 
 
 # ── GET /alerts ───────────────────────────────────────────────────────────────
@@ -207,12 +276,12 @@ async def set_threshold(
 @limiter.limit("1000/minute")
 async def list_alerts(
     request: Request,
+    project_id: uuid.UUID,
     tenant_id: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ):
     """List triggered alerts for the authenticated project."""
-    project_id: str = _require_project(request)
     extra = "AND tenant_id = :tenant_id" if tenant_id else ""
     params: dict = {"project_id": project_id, "limit": limit}
     if tenant_id:
@@ -354,10 +423,7 @@ async def create_project(
     now = datetime.now(timezone.utc)
     raw_api_key = "ct_" + secrets.token_urlsafe(40)
 
-    print("CREATED KEY:", repr(raw_api_key))
-
     key_hash = Project.hash_key(raw_api_key)
-    print("CREATED HASH:", key_hash)
     new_project = Project(
         id=project_id,
         name=body.name.strip(),
@@ -386,3 +452,70 @@ async def create_project(
         api_key=raw_api_key,  # shown once; frontend must copy it
         created_at=new_project.created_at,
     )
+
+
+class UpdateProjectRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    plan: str = Field("free", pattern="^(free|pro|enterprise)$")
+
+
+# ------------------------ update projecy -----------------------
+
+
+@router.put("/projects/{project_id}", tags=["projects"])
+async def update_project(
+    project_id: uuid.UUID,
+    body: UpdateProjectRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a project's name and plan."""
+    user_id = _require_user(request)
+
+    result = await db.execute(
+        select(Project).where(
+            Project.id == project_id,
+            Project.owner_id == user_id,
+        )
+    )
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project.name = body.name.strip()
+    project.plan = body.plan
+    await db.commit()
+    await db.refresh(project)
+
+    return {
+        "id": project.id,
+        "name": project.name,
+        "plan": project.plan,
+        "created_at": project.created_at.isoformat(),
+    }
+
+
+# ------------------------------ delete project -------------------------------
+
+
+@router.delete("/projects/{project_id}", status_code=204, tags=["projects"])
+async def delete_project(
+    project_id: uuid.UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a project. Only the owner can delete it."""
+    user_id = _require_user(request)
+
+    result = await db.execute(
+        select(Project).where(
+            Project.id == project_id,
+            Project.owner_id == user_id,
+        )
+    )
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    await db.delete(project)
+    await db.commit()

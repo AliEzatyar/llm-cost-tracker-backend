@@ -1,0 +1,38 @@
+# Environment variables and secrets
+.env
+*.env
+.env.*
+!.env.example
+
+# Python cache and temporary files
+__pycache__/
+**.pyc
+**.pyo
+**.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Poetry and Virtual Environments
+**.venv/
+**venv/
+**ENV/
+**dist/
+**build/
+**.egg-info/
+
+# Alembic cache
+**.cache
+
+# Databases (Local SQLite)
+**.db
+**.sqlite3
+
+# IDEs and OS files
+**.vscode/
+*.idea/
+*.DS_Store
+**Thumbs.db
+**backend/__pycache__/**

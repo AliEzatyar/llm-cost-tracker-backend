@@ -61,6 +61,8 @@ class Project(Base):
     @staticmethod
     def hash_key(raw_key: str) -> str:
         return hashlib.sha256(raw_key.encode()).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Lightweight query helpers (used by services in main.py)
 # ---------------------------------------------------------------------------
@@ -74,7 +76,7 @@ async def get_project_by_api_key(
         text("SELECT * FROM projects WHERE api_key_hash = :h"),
         {"h": key_hash},
     )
-    row = result.mappings().first() 
+    row = result.mappings().first()
     return dict(row) if row else None
 
 
@@ -87,7 +89,9 @@ async def get_project_by_id(session: AsyncSession, project_id: str) -> "Project 
     return dict(row) if row else None
 
 
-async def get_project_by_owner_id(session: AsyncSession, owner_id: str) -> "Project | None":
+async def get_project_by_owner_id(
+    session: AsyncSession, owner_id: str
+) -> "Project | None":
     result = await session.execute(
         text("SELECT * FROM projects WHERE owner_id = :o"),
         {"o": owner_id},
@@ -121,7 +125,7 @@ class CostEvent(Base):
     output_tokens: int = Column(Integer, nullable=False, default=0)
     cost_usd: float = Column(Numeric(12, 8), nullable=False)
     created_at: datetime = Column(
-        DateTime(timezone=True), default=datetime.utcnow, index=True
+        DateTime(timezone=True), default=datetime.now(timezone.utc), index=True
     )
     project = relationship("Project", back_populates="cost_events")
 
@@ -147,7 +151,7 @@ class CustomerCostDaily(Base):
     date: Date = Column(Date, nullable=False, index=True)
     total_cost_usd: float = Column(Numeric(12, 6), nullable=False, default=0)
     total_calls: int = Column(Integer, nullable=False, default=0)
-    
+
     __table_args__ = (
         UniqueConstraint("project_id", "tenant_id", "date", name="uq_cost_daily_pcd"),
     )
@@ -249,6 +253,116 @@ class User(Base):
         back_populates="owner",
         cascade="all, delete-orphan",
     )
+    is_admin : Mapped[bool] = mapped_column(Boolean, nullable=True, default=False)
+
+
+class ModelPricing(Base):
+    """
+    DB-backed pricing registry — mirrors pricing.py's ModelRates dataclass.
+
+    Rates are stored as USD per 1,000,000 tokens (per-million), matching the
+    convention used throughout the cost_calculator.
+
+    Price history is preserved by inserting NEW rows with a later effective_from
+    rather than updating existing ones. The cost engine always picks the row
+    with the latest effective_from that is <= NOW().
+
+    Cache rate conventions (same as pricing.py):
+        OpenAI     — cache_write=0 (automatic), cache_read=50% of input
+        Anthropic  — cache_write=125% of input, cache_read=10% of input
+        Google     — cache_write=input rate,    cache_read=25% of input
+    """
+
+    __tablename__ = "model_pricing"
+
+    id: str = Column(
+        UUID(as_uuid=False), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    provider: str = Column(Text, nullable=False)  # openai | anthropic | google …
+    model_id: str = Column(Text, nullable=False)  # canonical model string
+
+    input_per_million: float = Column(Numeric(14, 6), nullable=False)
+    output_per_million: float = Column(Numeric(14, 6), nullable=False)
+    cache_write_per_million: float = Column(Numeric(14, 6), nullable=False, default=0)
+    cache_read_per_million: float = Column(Numeric(14, 6), nullable=False, default=0)
+
+    # Multiplier applied when is_batch=True (0.5 = 50% off)
+    batch_discount: float = Column(Numeric(5, 4), nullable=False, default=0.5)
+
+    # A later effective_from = new price period; old rows stay for audit history
+    effective_from: datetime = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    created_at: datetime = Column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: datetime = Column(
+        DateTime(timezone=True),
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    __table_args__ = (
+        # One price per (provider, model, date) — insert a new row to change price
+        UniqueConstraint(
+            "provider",
+            "model_id",
+            "effective_from",
+            name="uq_pricing_provider_model_date",
+        ),
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "provider": self.provider,
+            "model_id": self.model_id,
+            "input_per_million": float(self.input_per_million),
+            "output_per_million": float(self.output_per_million),
+            "cache_write_per_million": float(self.cache_write_per_million),
+            "cache_read_per_million": float(self.cache_read_per_million),
+            "batch_discount": float(self.batch_discount),
+            "effective_from": (
+                self.effective_from.isoformat() if self.effective_from else None
+            ),
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Pricing query helper
+# ---------------------------------------------------------------------------
+
+
+async def get_model_pricing(
+    session: AsyncSession,
+    provider: str,
+    model_id: str,
+) -> "dict | None":
+    """
+    Return the most recent pricing row for (provider, model_id) whose
+    effective_from is <= NOW(). Returns None when not found — callers
+    should fall back to the static pricing.py PRICING_TABLE.
+    """
+    result = await session.execute(
+        text("""
+            SELECT
+                input_per_million,
+                output_per_million,
+                cache_write_per_million,
+                cache_read_per_million,
+                batch_discount
+            FROM model_pricing
+            WHERE  provider        = :provider
+              AND  model_id        = :model_id
+              AND  effective_from <= NOW()
+            ORDER  BY effective_from DESC
+            LIMIT  1
+        """),
+        {"provider": provider, "model_id": model_id},
+    )
+    row = result.mappings().first()
+    return dict(row) if row else None
 
 
 class RefreshToken(Base):
