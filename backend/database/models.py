@@ -41,7 +41,7 @@ class Project(Base):
     name: str = Column(Text, nullable=False)
     api_key_hash: str = Column(Text, nullable=False, unique=True, index=True)
     plan: str = Column(Text, nullable=False, default="free")  # free | pro | enterprise
-    created_at: datetime = Column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at: datetime = Column(DateTime(timezone=True), default=datetime.now(timezone.utc))
 
     # relationships
     cost_events = relationship("CostEvent", back_populates="project", lazy="noload")
@@ -177,9 +177,9 @@ class Threshold(Base):
     )
     tenant_id: str = Column(Text, nullable=False)
     limit_usd: float = Column(Numeric(12, 4), nullable=False)
-    created_at: datetime = Column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at: datetime = Column(DateTime(timezone=True), default=datetime.now(timezone.utc))
     updated_at: datetime = Column(
-        DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime(timezone=True), default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc)
     )
 
     __table_args__ = (
@@ -208,7 +208,7 @@ class Alert(Base):
     )
     tenant_id: str = Column(Text, nullable=False, index=True)
     triggered_at: datetime = Column(
-        DateTime(timezone=True), default=datetime.utcnow, index=True
+        DateTime(timezone=True), default=datetime.now(timezone.utc), index=True
     )
     cost_at_trigger: float = Column(Numeric(12, 6), nullable=False)
 
@@ -295,11 +295,11 @@ class ModelPricing(Base):
         nullable=False,
         default=lambda: datetime(2024, 1, 1, tzinfo=timezone.utc),
     )
-    created_at: datetime = Column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at: datetime = Column(DateTime(timezone=True), default=datetime.now(timezone.utc))
     updated_at: datetime = Column(
         DateTime(timezone=True),
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
+        default=datetime.now(timezone.utc),
+        onupdate=datetime.now(timezone.utc),
     )
 
     __table_args__ = (

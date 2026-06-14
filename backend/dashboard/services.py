@@ -53,16 +53,16 @@ class CostService:
             },
         )
         return {"id": event_id, "status": "accepted"}
-
     async def get_by_tenant(
-        self,
-        project_id: str,
-        date_from: date | None = None,
-        date_to: date | None = None,
-    ) -> list[dict]:
+            self,
+            project_id: str,
+            date_from: date | None = None,
+            date_to: date | None = None,
+        ) -> list[dict]:
         """Return daily rollup rows for all customers in this project.
         Joins cost_events to include total token counts (input + output)
         per customer per day, which are not stored in customer_cost_daily.
+        Also includes each tenant's configured limit_usd from thresholds, if any.
         """
         filters = ["ccd.project_id = :project_id"]
         params: dict = {"project_id": project_id}
@@ -84,20 +84,23 @@ class CostService:
                     ccd.total_calls,
                     COALESCE(SUM(ce.input_tokens), 0)  AS total_input_tokens,
                     COALESCE(SUM(ce.output_tokens), 0) AS total_output_tokens,
-                    COALESCE(SUM(ce.input_tokens + ce.output_tokens), 0) AS total_tokens
+                    COALESCE(SUM(ce.input_tokens + ce.output_tokens), 0) AS total_tokens,
+                    th.limit_usd
                 FROM   customer_cost_daily ccd
                 LEFT JOIN cost_events ce
                     ON  ce.project_id = ccd.project_id
                     AND ce.tenant_id  = ccd.tenant_id
                     AND ce.created_at::date = ccd.date
+                LEFT JOIN thresholds th
+                    ON  th.project_id = ccd.project_id
+                    AND th.tenant_id  = ccd.tenant_id
                 WHERE  {where}
-                GROUP  BY ccd.tenant_id, ccd.date, ccd.total_cost_usd, ccd.total_calls
+                GROUP  BY ccd.tenant_id, ccd.date, ccd.total_cost_usd, ccd.total_calls, th.limit_usd
                 ORDER  BY ccd.date DESC, ccd.total_cost_usd DESC
             """),
             params,
         )
         return [dict(r) for r in result.mappings()]
-
     async def get_customer_breakdown(
         self,
         project_id: str,
@@ -310,7 +313,7 @@ class AlertService:
             "tenant_id": breach["tenant_id"],
             "limit_usd": float(breach["limit_usd"]),
             "current_cost_usd": float(breach["current_cost"]),
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc)().isoformat(),
         }
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.post(ALERT_WEBHOOK_URL, json=payload)
