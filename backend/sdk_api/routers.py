@@ -2,12 +2,15 @@
 # ROUTES
 # ===========================================================================
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.dashboard.services import (
-    BillingService,
     CostService,
 )
+
+from pydantic import BaseModel
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
 from backend.database.database import get_db
 from backend.configs import (
     CostEventBatch,
@@ -16,6 +19,10 @@ from backend.configs import limiter
 from backend.database.models import CostEvent, Threshold
 from backend.sdk_api.cost_calculator import calculate_cost
 from sqlalchemy import text
+from datetime import datetime, timezone
+from fastapi import Depends, Query
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(prefix="/api", tags=["backend"])
 
@@ -54,7 +61,24 @@ async def _fetch_db_rates(
 # calls it.
 
 
-@router.post("/ingest", status_code=202, tags=["costs"])
+async def check_plan_limits(request: Request):
+    project = request.state.project
+    if project["is_blocked"] == True:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "code": "plan_limit_reached",
+                "message": f"Project {project['id']} must upgrade to access this feature.",
+            },
+        )
+
+
+@router.post(
+    "/ingest",
+    status_code=202,
+    tags=["costs"],
+    dependencies=[Depends(check_plan_limits)],
+)
 @limiter.limit("1000/minute")
 async def ingest_cost_event(
     request: Request,
@@ -63,11 +87,9 @@ async def ingest_cost_event(
 ):
     """Receive a batch of SDK cost events, calculate their cost, and persist them."""
     project_id = request.state.project_id
-    billing = BillingService(db)
-    await billing.enforce_limit(project_id)
     cost_svc = CostService(db)
     counter = 0
-
+    
     for ev in events.events:
         # ── Resolve provider from model name ──────────────────────────────────
         from ..sdk_api.pricing import infer_provider
@@ -98,15 +120,9 @@ async def ingest_cost_event(
     return {"accepted": counter}
 
 
-from datetime import datetime, timezone
-from fastapi import Depends, Query
-from sqlalchemy import select, func
-from sqlalchemy.ext.asyncio import AsyncSession
-
-
-@router.get("/check-limit", status_code=200, tags=["check limit"])
+@router.get("/check-tenant-limit", status_code=200, tags=["check tenant limit"])
 @limiter.limit("1000/minute")
-async def check_usage_limit(
+async def check_tenant_usage_limit(
     request: Request,
     tenant_id: str = Query(...),
     db: AsyncSession = Depends(get_db),
@@ -148,10 +164,6 @@ async def check_usage_limit(
         "period_start": month_start.isoformat(),
         "period_end": now.isoformat(),
     }
-
-
-from pydantic import BaseModel
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 
 class SetThresholdRequest(BaseModel):

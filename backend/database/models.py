@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import hashlib
 from typing import Optional
 import uuid
+from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import (
@@ -19,6 +20,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Boolean,
     func,
+    select,
     text,
 )
 
@@ -27,6 +29,9 @@ class Base(DeclarativeBase):
     pass
 
 
+# ---------------------------------------------------------------------------
+# Project and query helpers (used by services in main.py)
+# ---------------------------------------------------------------------------
 class Project(Base):
     """
     One row per SaaS customer / API key holder.
@@ -40,8 +45,12 @@ class Project(Base):
     )
     name: str = Column(Text, nullable=False)
     api_key_hash: str = Column(Text, nullable=False, unique=True, index=True)
-    plan: str = Column(Text, nullable=False, default="free")  # free | pro | enterprise
-    created_at: datetime = Column(DateTime(timezone=True), default=datetime.now(timezone.utc))
+    plan: str = Column(
+        Text, nullable=False, default="free"
+    )  # see backend/billing/plans.py PLANS keys: free | starter | growth | scale | enterprise
+    created_at: datetime = Column(
+        DateTime(timezone=True), default=datetime.now(timezone.utc)
+    )
 
     # relationships
     cost_events = relationship("CostEvent", back_populates="project", lazy="noload")
@@ -57,15 +66,14 @@ class Project(Base):
         index=True,
     )
     owner: Mapped[Optional["User"]] = relationship("User", back_populates="projects")
+    grace_period_started_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    is_blocked: Mapped[bool] = mapped_column(Boolean, nullable=True, default=False)
 
     @staticmethod
     def hash_key(raw_key: str) -> str:
         return hashlib.sha256(raw_key.encode()).hexdigest()
-
-
-# ---------------------------------------------------------------------------
-# Lightweight query helpers (used by services in main.py)
-# ---------------------------------------------------------------------------
 
 
 async def get_project_by_api_key(
@@ -80,26 +88,30 @@ async def get_project_by_api_key(
     return dict(row) if row else None
 
 
+async def get_current_project(
+    session: AsyncSession, request: Request
+) -> "Project | None":
+    project_id = request.headers.get("X-Project-ID")
+    result = await session.execute(
+        text("SELECT * FROM projects WHERE id = :i"),
+        {"i": project_id},
+    )
+    row = result.mappings().first()
+    return dict(row) if row else None
+
+
 async def get_project_by_id(session: AsyncSession, project_id: str) -> "Project | None":
     result = await session.execute(
-        text("SELECT * FROM projects WHERE id = :id"),
-        {"id": project_id},
+        select(Project).where(
+            Project.id == project_id,
+        )
     )
-    row = result.mappings().first()
-    return dict(row) if row else None
+    return result.scalar_one_or_none()
 
 
-async def get_project_by_owner_id(
-    session: AsyncSession, owner_id: str
-) -> "Project | None":
-    result = await session.execute(
-        text("SELECT * FROM projects WHERE owner_id = :o"),
-        {"o": owner_id},
-    )
-    row = result.mappings().first()
-    return dict(row) if row else None
-
-
+# ---------------------------------------------------------------------------
+# Cost models
+# ---------------------------------------------------------------------------
 class CostEvent(Base):
     """
     Raw ingest table — every token-usage event written here immediately.
@@ -159,6 +171,9 @@ class CustomerCostDaily(Base):
     project = relationship("Project", back_populates="cost_daily")
 
 
+# ---------------------------------------------------------------------------
+# threshold and alert models
+# ---------------------------------------------------------------------------
 class Threshold(Base):
     """
     Per-customer spend cap.  AlertService checks these every minute.
@@ -177,9 +192,13 @@ class Threshold(Base):
     )
     tenant_id: str = Column(Text, nullable=False)
     limit_usd: float = Column(Numeric(12, 4), nullable=False)
-    created_at: datetime = Column(DateTime(timezone=True), default=datetime.now(timezone.utc))
+    created_at: datetime = Column(
+        DateTime(timezone=True), default=datetime.now(timezone.utc)
+    )
     updated_at: datetime = Column(
-        DateTime(timezone=True), default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc)
+        DateTime(timezone=True),
+        default=datetime.now(timezone.utc),
+        onupdate=datetime.now(timezone.utc),
     )
 
     __table_args__ = (
@@ -218,8 +237,6 @@ class Alert(Base):
 # ---------------------------------------------------------------------------
 # Auth models
 # ---------------------------------------------------------------------------
-
-
 class User(Base):
     __tablename__ = "users"
 
@@ -253,9 +270,12 @@ class User(Base):
         back_populates="owner",
         cascade="all, delete-orphan",
     )
-    is_admin : Mapped[bool] = mapped_column(Boolean, nullable=True, default=False)
+    is_admin: Mapped[bool] = mapped_column(Boolean, nullable=True, default=False)
 
 
+# ---------------------------------------------------------------------------
+# LLM models pricing
+# ---------------------------------------------------------------------------
 class ModelPricing(Base):
     """
     DB-backed pricing registry — mirrors pricing.py's ModelRates dataclass.
@@ -295,7 +315,9 @@ class ModelPricing(Base):
         nullable=False,
         default=lambda: datetime(2024, 1, 1, tzinfo=timezone.utc),
     )
-    created_at: datetime = Column(DateTime(timezone=True), default=datetime.now(timezone.utc))
+    created_at: datetime = Column(
+        DateTime(timezone=True), default=datetime.now(timezone.utc)
+    )
     updated_at: datetime = Column(
         DateTime(timezone=True),
         default=datetime.now(timezone.utc),
@@ -332,8 +354,6 @@ class ModelPricing(Base):
 # ---------------------------------------------------------------------------
 # Pricing query helper
 # ---------------------------------------------------------------------------
-
-
 async def get_model_pricing(
     session: AsyncSession,
     provider: str,
@@ -397,3 +417,156 @@ class RefreshToken(Base):
     revoked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     user: Mapped["User"] = relationship("User")
+
+
+# --------------------------------------------------------------------------
+# Billing and subscription
+# --------------------------------------------------------------------------
+
+
+class Subscription(Base):
+    """
+    One active subscription per project.
+    Stripe customer + subscription data cached here so we avoid
+    round-tripping to Stripe on every request.
+    """
+
+    __tablename__ = "subscriptions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    project_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,  # one subscription per project
+        index=True,
+    )
+
+    # -------------- Stripe identifiers
+    stripe_customer_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True
+    )
+    stripe_subscription_id: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, unique=True, index=True
+    )
+    stripe_price_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    # Plan mirrored from projects.plan for fast reads
+    plan: Mapped[str] = mapped_column(Text, nullable=False, default="free")
+
+    # Subscription lifecycle
+    status: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="active",
+        # active | past_due | canceled | trialing | incomplete
+    )
+    current_period_start: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    current_period_end: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    cancel_at_period_end: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    usage_records: Mapped[list["MonthlyUsageSnapshot"]] = relationship(
+        "MonthlyUsageSnapshot", back_populates="subscription", lazy="noload"
+    )
+
+
+class MonthlyUsageSnapshot(Base):
+    """
+    Rolling monthly tracked-spend total per subscription.
+    Reset at the start of each billing period.
+    Used to enforce plan limits without hitting CustomerCostDaily every request.
+    """
+
+    __tablename__ = "monthly_usage_snapshots"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    subscription_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("subscriptions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Billing period this snapshot covers
+    period_start: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    period_end: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    tracked_spend_usd: Mapped[float] = mapped_column(
+        Numeric(14, 6), nullable=False, default=0.0
+    )
+    # Set True when spend > plan limit (after grace period → hard block)
+    limit_exceeded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    grace_period_started_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "subscription_id", "period_start", name="uq_usage_snapshot_sub_period"
+        ),
+    )
+
+    subscription: Mapped["Subscription"] = relationship(
+        "Subscription", back_populates="usage_records"
+    )
+
+
+class BillingEvent(Base):
+    """
+    Immutable audit log — every Stripe webhook event stored here.
+    Idempotency key = stripe_event_id.
+    """
+
+    __tablename__ = "billing_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    stripe_event_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True
+    )
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)  # e.g. invoice.paid
+    project_id: Mapped[Optional[str]] = mapped_column(
+        UUID(as_uuid=False),
+        ForeignKey("projects.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    payload: Mapped[str] = mapped_column(Text, nullable=False)  # raw JSON
+    processed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )

@@ -3,11 +3,10 @@
 # ===========================================================================
 
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import hmac
 import uuid
-from fastapi import HTTPException
 import httpx
 from sqlalchemy import text
 from backend.database.models import get_project_by_id
@@ -264,8 +263,8 @@ class AlertService:
             # Fire side-effects (best-effort, don't let failures block the commit)
             try:
                 project = await get_project_by_id(self.session, breach["project_id"])
-                await self.send_email(project, breach)
-                await self.send_webhook(project, breach)
+                await self.send_email(dict(project), breach)
+                await self.send_webhook(dict(project), breach)
             except Exception as exc:
                 logger.warning("Alert notification failed: %s", exc)
 
@@ -319,96 +318,3 @@ class AlertService:
             resp = await client.post(ALERT_WEBHOOK_URL, json=payload)
             resp.raise_for_status()
 
-
-class BillingService:
-    """Stripe-backed subscription checks."""
-
-    PLAN_LIMITS: dict[str, int] = {
-        "free": 1_000,
-        "pro": 100_000,
-        "enterprise": 10_000_000,
-    }
-
-    def __init__(self, session: AsyncSession):
-        self.session = session
-
-    async def get_plan(self, project_id: str) -> str:
-        result = await self.session.execute(
-            text("SELECT plan FROM projects WHERE id = :id"),
-            {"id": project_id},
-        )
-        row = result.scalar_one_or_none()
-        return row or "free"
-
-    async def is_active(self, project_id: str) -> bool:
-        """All projects in the DB are considered active.
-        Hook in a Stripe customer lookup here when you add subscriptions."""
-        result = await self.session.execute(
-            text("SELECT 1 FROM projects WHERE id = :id"),
-            {"id": project_id},
-        )
-        return result.scalar_one_or_none() is not None
-
-    async def enforce_limit(self, project_id: str) -> None:
-        """Raise 402 if the project has hit its monthly event ingestion limit."""
-        plan = await self.get_plan(project_id)
-        limit = self.PLAN_LIMITS.get(plan, 1_000)
-
-        result = await self.session.execute(
-            text("""
-                SELECT COUNT(*) FROM cost_events
-                WHERE project_id = :project_id
-                  AND created_at >= DATE_TRUNC('month', NOW())
-            """),
-            {"project_id": project_id},
-        )
-        count = result.scalar_one()
-        if count >= limit:
-            raise HTTPException(
-                status_code=402,
-                detail=f"Monthly event limit ({limit}) reached for plan '{plan}'. Please upgrade.",
-            )
-
-    async def handle_stripe_event(self, event_type: str, data: dict) -> dict:
-        """Handle Stripe webhook events to keep the projects.plan column in sync."""
-        if event_type == "customer.subscription.updated":
-            sub = data.get("object", {})
-            new_plan = sub.get("metadata", {}).get("plan", "free")
-            stripe_cust_id = sub.get("customer")
-            logger.info(
-                "Subscription updated: customer=%s plan=%s",
-                stripe_cust_id,
-                new_plan,
-            )
-            return {"handled": True, "plan": new_plan}
-
-        if event_type == "customer.subscription.deleted":
-            logger.info("Subscription cancelled: %s", data)
-            return {"handled": True, "plan": "free"}
-
-        return {"handled": False}
-
-
-# ---------------------------------------------------------------------------
-# Stripe signature verification helper
-# ---------------------------------------------------------------------------
-
-
-def _verify_stripe_signature(payload: bytes, sig_header: str, secret: str) -> None:
-    """
-    Reconstructs the expected Stripe signature and compares with constant-time
-    hmac comparison. Raises HTTP 400 on mismatch.
-    """
-    try:
-        parts = {k: v for k, v in (p.split("=", 1) for p in sig_header.split(","))}
-        timestamp = parts["t"]
-        received_sig = parts["v1"]
-    except (KeyError, ValueError):
-        raise HTTPException(status_code=400, detail="Invalid Stripe-Signature header")
-
-    signed_payload = f"{timestamp}.".encode() + payload
-    mac = hmac.new(secret.encode(), signed_payload, hashlib.sha256)
-    expected = mac.hexdigest()
-
-    if not hmac.compare_digest(expected, received_sig):
-        raise HTTPException(status_code=400, detail="Stripe signature mismatch")

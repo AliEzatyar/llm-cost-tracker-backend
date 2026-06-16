@@ -23,11 +23,12 @@ from .auth.services import ALGORITHM, SECRET_KEY
 from jose import jwt, JWTError
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from .database.database import AsyncSessionLocal
+from .database.database import AsyncSessionLocal, create_all_tables, drop_all_tables
 from backend.dashboard.routers import router as dashboard_router
 from .configs import limiter
 from .sdk_api.routers import router as sdk_api_router
 from backend.admin.routers import router as admin_router
+from .billing.routers import router as billing_router
 
 load_dotenv()
 
@@ -53,6 +54,7 @@ app.include_router(auth_router)
 app.include_router(dashboard_router)
 app.include_router(sdk_api_router)
 app.include_router(admin_router)
+app.include_router(billing_router)
 
 # ---- Auth middleware --------------------------------------------------------
 
@@ -60,7 +62,7 @@ BYPASS_PATHS = {
     "/docs",
     "/openapi.json",
     "/redoc",
-    "/webhooks/stripe",
+    "/billing/webhook",
     "/health",
     "/auth/login",
     "/auth/register",
@@ -146,6 +148,7 @@ from sqlalchemy import text
 @app.on_event("startup")
 async def startup():
     logger.info("Database tables verified / created.")
+    # await drop_all_tables()
     # await create_all_tables()
     # Start background scheduler (imported here to avoid circular imports)
     from .workers import start_scheduler

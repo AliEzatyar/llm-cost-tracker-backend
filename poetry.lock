@@ -129,6 +129,14 @@ python-versions = ">=3.9"
 pycparser = {version = "*", markers = "implementation_name != \"PyPy\""}
 
 [[package]]
+name = "charset-normalizer"
+version = "3.4.7"
+description = "The Real First Universal Charset Detector. Open, modern and actively maintained alternative to Chardet."
+category = "main"
+optional = false
+python-versions = ">=3.7"
+
+[[package]]
 name = "click"
 version = "8.4.1"
 description = "Composable command line interface toolkit"
@@ -547,6 +555,24 @@ pycrypto = ["pycrypto (>=2.6.0,<2.7.0)"]
 pycryptodome = ["pycryptodome (>=3.3.1,<4.0.0)"]
 
 [[package]]
+name = "requests"
+version = "2.34.2"
+description = "Python HTTP for Humans."
+category = "main"
+optional = false
+python-versions = ">=3.10"
+
+[package.dependencies]
+certifi = ">=2023.5.7"
+charset_normalizer = ">=2,<4"
+idna = ">=2.5,<4"
+urllib3 = ">=1.26,<3"
+
+[package.extras]
+socks = ["PySocks (>=1.5.6,!=1.5.7)"]
+use-chardet-on-py3 = ["chardet (>=3.0.2,<8)"]
+
+[[package]]
 name = "rsa"
 version = "4.9.1"
 description = "Pure-Python RSA implementation"
@@ -632,6 +658,21 @@ typing-extensions = {version = ">=4.10.0", markers = "python_version < \"3.13\""
 full = ["httpx (>=0.27.0,<0.29.0)", "itsdangerous", "jinja2", "python-multipart (>=0.0.18)", "pyyaml"]
 
 [[package]]
+name = "stripe"
+version = "15.2.1"
+description = "Python bindings for the Stripe API"
+category = "main"
+optional = false
+python-versions = ">=3.9"
+
+[package.dependencies]
+requests = ">=2.20"
+typing_extensions = ">=4.7.0"
+
+[package.extras]
+async = ["httpx"]
+
+[[package]]
 name = "tomli"
 version = "2.4.1"
 description = "A lil' TOML parser"
@@ -681,6 +722,20 @@ tzdata = {version = "*", markers = "platform_system == \"Windows\""}
 devenv = ["pytest (>=4.3)", "pytest-mock (>=3.3)", "pytest-cov", "check-manifest", "zest.releaser"]
 
 [[package]]
+name = "urllib3"
+version = "2.7.0"
+description = "HTTP library with thread-safe connection pooling, file post, and more."
+category = "main"
+optional = false
+python-versions = ">=3.10"
+
+[package.extras]
+brotli = ["brotli (>=1.2.0)", "brotlicffi (>=1.2.0.0)"]
+h2 = ["h2 (>=4,<5)"]
+socks = ["pysocks (>=1.5.6,!=1.5.7,<2.0)"]
+zstd = ["backports-zstd (>=1.0.0)"]
+
+[[package]]
 name = "uvicorn"
 version = "0.49.0"
 description = "The lightning-fast ASGI server."
@@ -718,7 +773,7 @@ dev = ["pytest", "setuptools"]
 [metadata]
 lock-version = "1.1"
 python-versions = "^3.10"
-content-hash = "e448ecf79101362b415d8efc6066c0205c6a28ea7d3d09b0b77449ac68673b28"
+content-hash = "669fe070d21c8d9c1f008490e3eb8fd818754929973917ecbcc02a6dcf7644b4"
 
 [metadata.files]
 alembic = []
@@ -732,6 +787,7 @@ atomicwrites = []
 attrs = []
 certifi = []
 cffi = []
+charset-normalizer = []
 click = []
 colorama = []
 cryptography = []
@@ -763,16 +819,19 @@ pydantic-core = []
 pytest = []
 python-dotenv = []
 python-jose = []
+requests = []
 rsa = []
 six = []
 slowapi = []
 sqlalchemy = []
 starlette = []
+stripe = []
 tomli = []
 typing-extensions = []
 typing-inspection = []
 tzdata = []
 tzlocal = []
+urllib3 = []
 uvicorn = []
 wcwidth = []
 wrapt = []

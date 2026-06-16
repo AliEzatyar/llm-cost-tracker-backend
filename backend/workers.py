@@ -13,16 +13,36 @@ Dependencies:
 Upgrade path:
     When you outgrow in-process scheduling, replace each job function body
     with a Celery task and point the scheduler at a Redis broker instead.
+Background worker — run hourly (via APScheduler, Celery, or a cron job).
+Syncs tracked LLM spend from CustomerCostDaily into MonthlyUsageSnapshot
+and enforces plan limits with grace periods.
+
+Usage example with APScheduler:
+    from billing.worker import sync_all_projects
+    scheduler.add_job(sync_all_projects, "interval", hours=1)
+
+
 """
 
 import logging
-
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-
 from .database.database import AsyncSessionLocal
 from .dashboard.services import AlertService, CostService
+import logging
+from datetime import datetime, timezone
+from apscheduler.triggers.interval import IntervalTrigger
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker
+from backend.database.models import Project, Subscription
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from backend.billing.services import sync_tracked_spend
+
+logger = logging.getLogger(__name__)
+
+scheduler = AsyncIOScheduler(timezone="UTC")
+
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +141,78 @@ async def job_sync_model_pricing() -> None:
     #     await session.commit()
 
 
+async def sync_all_projects(session_factory: async_sessionmaker) -> None:
+    """
+    Iterate every active subscription and sync its tracked spend.
+    Pass in your async_sessionmaker from your app's DB setup.
+    """
+    async with session_factory() as session:
+        result = await session.execute(
+            select(Subscription).where(
+                Subscription.status.in_(["active", "past_due", "trialing"])
+            )
+        )
+        subscriptions = result.scalars().all()
+    for sub in subscriptions:
+        if not sub.current_period_start or not sub.current_period_end:
+            logger.warning(
+                "Skipping project=%s — subscription has no period dates yet (webhook pending?)",
+                sub.project_id,
+            )
+            continue
+        else:
+            period_start = sub.current_period_start
+            period_end = sub.current_period_end
+
+        async with session_factory() as session:
+            try:
+                total = await sync_tracked_spend(
+                    session=session,
+                    project_id=sub.project_id,
+                    period_start=period_start,
+                    period_end=period_end,
+                )
+                logger.info(
+                    "Synced project=%s plan=%s spend=$%.4f",
+                    sub.project_id,
+                    sub.plan,
+                    total,
+                )
+            except Exception:
+                logger.exception("Failed to sync project=%s", sub.project_id)
+
+
+async def sync_free_projects_usage(session_factory: async_sessionmaker) -> None:
+    async with session_factory() as session:
+        result = await session.execute(
+            select(Project).where(~Project.id.in_(select(Subscription.project_id)))
+        )
+        projects = result.scalars().all()
+        now = datetime.now(timezone.utc)
+        period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if now.month == 12:
+            period_end = period_start.replace(year=now.year + 1, month=1)
+        else:
+            period_end = period_start.replace(month=now.month + 1)
+        for project in projects:
+            async with session_factory() as session:
+                try:
+                    total = await sync_tracked_spend(
+                        session=session,
+                        project_id=project.id,
+                        period_start=period_start,
+                        period_end=period_end,
+                    )
+                    logger.info(
+                        "Synced project=%s plan=%s spend=$%.4f",
+                        project.id,
+                        project.plan,
+                        total,
+                    )
+                except Exception:
+                    logger.exception("Failed to sync project=%s", project.id)
+
+
 # ---------------------------------------------------------------------------
 # Scheduler bootstrap — called from main.py startup
 # ---------------------------------------------------------------------------
@@ -134,7 +226,7 @@ def start_scheduler() -> None:
     # 1-minute threshold checks
     scheduler.add_job(
         job_check_thresholds,
-        trigger=IntervalTrigger(minutes=1),
+        trigger=IntervalTrigger(hours=1),
         id="check_thresholds",
         name="Check cost thresholds",
         max_instances=1,  # never overlap if the previous run is still going
@@ -145,7 +237,7 @@ def start_scheduler() -> None:
     # Hourly rollup
     scheduler.add_job(
         job_rollup_daily,
-        trigger=IntervalTrigger(minutes=1),
+        trigger=IntervalTrigger(hours=1),
         id="rollup_daily",
         name="Rollup raw events to daily table",
         max_instances=1,
@@ -162,6 +254,27 @@ def start_scheduler() -> None:
         max_instances=1,
         replace_existing=True,
         misfire_grace_time=3600,
+    )
+    # 1-hour project usage snapshot syncing
+    scheduler.add_job(
+        sync_all_projects,
+        trigger=IntervalTrigger(seconds=100),
+        id="sync_all_projects_usage_snapshot",
+        name="Sync All Project Usage Sanpshot",
+        max_instances=1,  # never overlap if the previous run is still going
+        replace_existing=True,
+        kwargs={"session_factory": AsyncSessionLocal},
+        misfire_grace_time=30,  # seconds before a missed firing is skipped
+    )
+    scheduler.add_job(
+        sync_free_projects_usage,
+        trigger=IntervalTrigger(seconds=100),
+        id="sync_all_free_projects_usage",
+        name="Sync All Free Project Usage Sanpshot",
+        max_instances=1,  # never overlap if the previous run is still going
+        replace_existing=True,
+        kwargs={"session_factory": AsyncSessionLocal},
+        misfire_grace_time=30,  # seconds before a missed firing is skipped
     )
 
     scheduler.start()

@@ -14,14 +14,17 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select, text
 from backend.auth.services import get_current_user
 from backend.dashboard.services import (
-    BillingService,
     CostService,
-    _verify_stripe_signature,
 )
 from backend.database.database import get_db
-from backend.database.models import Alert, Project, Threshold, User, get_project_by_api_key
+from backend.database.models import (
+    Alert,
+    Project,
+    Threshold,
+    User,
+    get_project_by_api_key,
+)
 from backend.configs import (
-    STRIPE_WEBHOOK_SECRET,
     ThresholdIn,
 )
 from backend.configs import limiter
@@ -153,6 +156,7 @@ async def set_threshold(
         "limit_usd": body.limit_usd,
     }
 
+
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import select
@@ -188,6 +192,7 @@ async def list_thresholds(
         }
         for t in rows
     ]
+
 
 # ── PUT /thresholds/{threshold_id} ────────────────────────────────────────────
 
@@ -301,38 +306,15 @@ async def list_alerts(
     return {"project_id": project_id, "alerts": rows}
 
 
-# ── POST /webhooks/stripe ─────────────────────────────────────────────────────
-
-
-@router.post("/webhooks/stripe", tags=["billing"])
-async def stripe_webhook(request: Request, db: AsyncSession = Depends(get_db)):
-    """
-    Receive Stripe subscription events.
-    Validates the Stripe-Signature header when STRIPE_WEBHOOK_SECRET is set.
-    This endpoint intentionally skips JWT auth — Stripe signs its own payloads.
-    """
-    payload = await request.body()
-
-    if STRIPE_WEBHOOK_SECRET:
-        sig_header = request.headers.get("Stripe-Signature", "")
-        _verify_stripe_signature(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-
-    import json
-
-    event = json.loads(payload)
-    billing = BillingService(db)
-    result = await billing.handle_stripe_event(
-        event.get("type", ""), event.get("data", {})
-    )
-    return result
-
-
 # ── Project schemas ───────────────────────────────────────────────────────────
 
 
 class CreateProjectRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
-    plan: str = Field("free", pattern="^(free|pro|enterprise)$")
+    # Plan is informational only at creation time — every new project starts
+    # on "free" regardless of what's sent here. Upgrading to a paid plan
+    # requires a Stripe Checkout session (POST /billing/checkout), since a
+    # paid plan with no Stripe subscription would be an inconsistent state.
 
 
 class CreateProjectResponse(BaseModel):
@@ -421,13 +403,14 @@ async def create_project(
 
     project_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
-    raw_api_key = "ct_" + secrets.token_urlsafe(40)
 
-    key_hash = Project.hash_key(raw_api_key)
+    # Every project starts on the free plan. Upgrading to a paid plan is a
+    # separate step (Stripe Checkout via POST /billing/checkout) so that
+    # projects.plan never gets ahead of an actual Stripe subscription.
     new_project = Project(
         id=project_id,
         name=body.name.strip(),
-        plan=body.plan,
+        plan="free",
         api_key_hash=key_hash,
         owner_id=owner_id,
         created_at=now,
@@ -456,7 +439,12 @@ async def create_project(
 
 class UpdateProjectRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
-    plan: str = Field("free", pattern="^(free|pro|enterprise)$")
+    # Plan is intentionally NOT editable here. Changing plans has billing
+    # consequences (Stripe subscription create/upgrade/downgrade) and must
+    # go through the /billing endpoints:
+    #   free -> paid   : POST /billing/checkout
+    #   paid -> paid   : POST /billing/change-plan
+    #   paid -> free   : POST /billing/cancel
 
 
 # ------------------------ update projecy -----------------------
@@ -469,7 +457,7 @@ async def update_project(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Update a project's name and plan."""
+    """Update a project's name. Plan changes go through /billing endpoints."""
     user_id = _require_user(request)
 
     result = await db.execute(
@@ -483,7 +471,6 @@ async def update_project(
         raise HTTPException(status_code=404, detail="Project not found")
 
     project.name = body.name.strip()
-    project.plan = body.plan
     await db.commit()
     await db.refresh(project)
 
