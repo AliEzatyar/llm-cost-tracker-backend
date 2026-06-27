@@ -9,6 +9,8 @@ Run:
     uvicorn main:app --reload
 """
 
+from contextlib import asynccontextmanager
+
 from .database.models import (
     get_project_by_api_key,
 )
@@ -29,6 +31,8 @@ from .configs import limiter
 from .sdk_api.routers import router as sdk_api_router
 from backend.admin.routers import router as admin_router
 from .billing.routers import router as billing_router
+from .exceptions import register_exception_handlers
+
 
 load_dotenv()
 
@@ -39,8 +43,23 @@ logging.basicConfig(level=logging.INFO)
 # ---------------------------------------------------------------------------
 # App & middleware
 # ---------------------------------------------------------------------------
+from .redis_client import create_redis_client
 
-app = FastAPI(title="Cost Tracker API", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Database tables verified / created.")
+    # await drop_all_tables()
+    # await create_all_tables()
+    # Start background scheduler (imported here to avoid circular imports)
+    from .workers import start_scheduler
+    start_scheduler()
+    logger.info("Background scheduler started.")
+    app.state.redis = create_redis_client()
+    yield
+    await app.state.redis.aclose()
+
+app = FastAPI(lifespan=lifespan,title="Cost Tracker API", version="1.0.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
@@ -55,7 +74,7 @@ app.include_router(dashboard_router)
 app.include_router(sdk_api_router)
 app.include_router(admin_router)
 app.include_router(billing_router)
-
+register_exception_handlers(app)
 # ---- Auth middleware --------------------------------------------------------
 
 BYPASS_PATHS = {
@@ -95,6 +114,7 @@ async def auth_middleware(request: Request, call_next):
         request.state.auth_type = "api_key"
         request.state.project = project
         request.state.project_id = str(project["id"])
+        request.state.user_id = str(project["owner_id"])
         return await call_next(request)
 
     # --------------------------------------------------

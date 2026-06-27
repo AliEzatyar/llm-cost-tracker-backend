@@ -48,26 +48,26 @@ async def get_subscription(
 
 async def get_or_create_subscription(
     session: AsyncSession,
-    project: dict,
+    project: Project,
     user_email: str,
 ) -> Subscription:
     """
     Idempotent — returns existing subscription or bootstraps a free-tier one.
     `project` is the dict returned by get_project_by_id().
     """
-    existing = await get_subscription(session, project["id"])
+    existing = await get_subscription(session, project.id)
     if existing:
         return existing
 
     # Create a Stripe customer for this project
     stripe_customer = create_customer(
         email=user_email,
-        project_id=project["id"],
-        name=project["name"],
+        project_id=project.id,
+        name=project.name,
     )
 
     sub = Subscription(
-        project_id=project["id"],
+        project_id=project.id,
         stripe_customer_id=stripe_customer["id"],
         plan="free",
         status="active",
@@ -84,7 +84,7 @@ async def get_or_create_subscription(
 
 async def create_upgrade_checkout(
     session: AsyncSession,
-    project: dict,
+    project: Project,
     user_email: str,
     plan_key: str,
     success_url: str,
@@ -103,7 +103,7 @@ async def create_upgrade_checkout(
         price_id=plan.stripe_price_id_monthly,
         success_url=success_url,
         cancel_url=cancel_url,
-        project_id=project["id"],
+        project_id=project.id,
     )
     await session.commit()
     return session_obj["url"]
@@ -304,7 +304,6 @@ async def is_project_blocked(session: AsyncSession, project_id: str) -> bool:
     set by sync_tracked_spend after the grace period is exhausted.
 
     Paid plans: reads limit_exceeded from the latest MonthlyUsageSnapshot.
-    Enterprise: never blocked (unlimited spend).
     """
     sub = await get_subscription(session, project_id)
 
@@ -316,9 +315,6 @@ async def is_project_blocked(session: AsyncSession, project_id: str) -> bool:
         )
         row = result.mappings().first()
         return bool(row and row["is_blocked"])
-
-    if sub.plan == "enterprise":
-        return False  # unlimited
 
     result = await session.execute(
         select(MonthlyUsageSnapshot)

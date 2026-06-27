@@ -9,6 +9,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import (
     TIMESTAMP,
     Column,
+    Index,
     String,
     Text,
     Numeric,
@@ -24,6 +25,8 @@ from sqlalchemy import (
     text,
 )
 
+SYSTEM_DEFINED_MODEL = "SYSTEM"
+USER_DEFINED_MODEL = "USER"
 
 class Base(DeclarativeBase):
     pass
@@ -93,11 +96,11 @@ async def get_current_project(
 ) -> "Project | None":
     project_id = request.headers.get("X-Project-ID")
     result = await session.execute(
-        text("SELECT * FROM projects WHERE id = :i"),
-        {"i": project_id},
+        select(Project).where(
+            Project.id == project_id,
+        )
     )
-    row = result.mappings().first()
-    return dict(row) if row else None
+    return result.scalar_one_or_none()
 
 
 async def get_project_by_id(session: AsyncSession, project_id: str) -> "Project | None":
@@ -109,6 +112,15 @@ async def get_project_by_id(session: AsyncSession, project_id: str) -> "Project 
     return result.scalar_one_or_none()
 
 
+async def get_free_plan_project(
+    session: AsyncSession, owner_id: str
+) -> "Project | None":
+    result = await session.execute(
+        select(Project).where(Project.owner_id == owner_id, Project.plan == "free")
+    )
+    return result.scalar_one_or_none()
+
+
 # ---------------------------------------------------------------------------
 # Cost models
 # ---------------------------------------------------------------------------
@@ -116,10 +128,27 @@ class CostEvent(Base):
     """
     Raw ingest table — every token-usage event written here immediately.
     Rolled up hourly into CustomerCostDaily.
+
+    Column groups
+    ─────────────
+    Core            provider, endpoint, model, cost_usd, created_at
+    Text tokens     input_tokens, cached_tokens, output_tokens, total_tokens
+                    (OpenAI: cached_tokens is a sub-field of input_tokens,
+                     i.e. fresh = input_tokens − cached_tokens)
+    Audio tokens    audio_input_tokens, audio_output_tokens
+                    (gpt-4o-transcribe token mode, gpt-4o-realtime)
+    Audio flat      duration_seconds   (whisper-1 per-minute billing)
+    Speech flat     character_count    (tts-1 / tts-1-hd per-character billing)
+    Image tokens    input_text_tokens, cached_input_text_tokens,
+                    input_image_tokens, cached_input_image_tokens,
+                    output_image_tokens
+                    (gpt-image-1 / 1-mini / 1.5 / 2 — five billing dimensions)
+    Image audit     image_count        (number of images generated, for audit)
     """
 
     __tablename__ = "cost_events"
 
+    # ── identity ──────────────────────────────────────────────────────────────
     id: str = Column(
         UUID(as_uuid=False), primary_key=True, default=lambda: str(uuid.uuid4())
     )
@@ -129,16 +158,49 @@ class CostEvent(Base):
         nullable=False,
         index=True,
     )
-    tenant_id: str = Column(
-        Text, nullable=False, index=True
-    )  # your end-user / tenant ID
-    model: str = Column(Text, nullable=False)
-    input_tokens: int = Column(Integer, nullable=False, default=0)
-    output_tokens: int = Column(Integer, nullable=False, default=0)
-    cost_usd: float = Column(Numeric(12, 8), nullable=False)
+    tenant_id: str = Column(Text, nullable=True, index=True)
+
+    # ── call metadata ─────────────────────────────────────────────────────────
+    provider: str = Column(Text, nullable=True)  # "openai", "anthropic", …
+    endpoint: str = Column(
+        Text, nullable=True
+    )  # "chat.completions", "images.generate", …
+    model: str = Column(Text, nullable=True)
+
+    # ── text token columns ────────────────────────────────────────────────────
+    input_tokens: int = Column(Integer, nullable=True, default=0)
+    cached_tokens: int = Column(Integer, nullable=True, default=0)
+    output_tokens: int = Column(Integer, nullable=True, default=0)
+    total_tokens: int = Column(Integer, nullable=True, default=0)
+
+    # ── audio token columns (gpt-4o-transcribe token mode, gpt-4o-realtime) ──
+    audio_input_tokens: int = Column(Integer, nullable=True, default=0)
+    audio_output_tokens: int = Column(Integer, nullable=True, default=0)
+
+    # ── audio flat billing (whisper-1) ────────────────────────────────────────
+    duration_seconds: float = Column(Numeric(10, 4), nullable=True, default=0)
+
+    # ── speech flat billing (tts-1, tts-1-hd) ────────────────────────────────
+    character_count: int = Column(Integer, nullable=True, default=0)
+
+    # ── image token columns (gpt-image-1, gpt-image-1-mini, gpt-image-1.5, gpt-image-2) ──
+    input_text_tokens: int = Column(Integer, nullable=True, default=0)
+    cached_input_text_tokens: int = Column(Integer, nullable=True, default=0)
+    input_image_tokens: int = Column(Integer, nullable=True, default=0)
+    cached_input_image_tokens: int = Column(Integer, nullable=True, default=0)
+    output_image_tokens: int = Column(Integer, nullable=True, default=0)
+
+    # ── image audit ───────────────────────────────────────────────────────────
+    image_count: int = Column(Integer, nullable=True, default=0)
+
+    # ── cost ──────────────────────────────────────────────────────────────────
+    cost_usd: float = Column(Numeric(12, 8), nullable=True)
+
+    # ── timestamp ─────────────────────────────────────────────────────────────
     created_at: datetime = Column(
         DateTime(timezone=True), default=datetime.now(timezone.utc), index=True
     )
+
     project = relationship("Project", back_populates="cost_events")
 
 
@@ -179,6 +241,8 @@ class Threshold(Base):
     Per-customer spend cap.  AlertService checks these every minute.
     """
 
+    PER_DAY = "per_day"
+    PER_MONTH = "per_month"
     __tablename__ = "thresholds"
 
     id: str = Column(
@@ -200,12 +264,28 @@ class Threshold(Base):
         default=datetime.now(timezone.utc),
         onupdate=datetime.now(timezone.utc),
     )
-
+    frequency: str = Column(Text, nullable=True, default=PER_MONTH)
+    effective_date: datetime = Column(
+        DateTime(timezone=True),
+        default=datetime.now(timezone.utc),
+        onupdate=datetime.now(timezone.utc),
+        nullable=True,
+    )
     __table_args__ = (
         UniqueConstraint("project_id", "tenant_id", name="uq_threshold_pc"),
     )
 
     project = relationship("Project", back_populates="thresholds")
+    def to_dict(self) -> dict:
+        """Converts the Threshold model instance into a dictionary."""
+        return {
+            "id": self.id,
+            "project_id": self.project_id,
+            "tenant_id": self.tenant_id,
+            "limit_usd": float(self.limit_usd) if self.limit_usd is not None else None,
+            "frequency": self.frequency,
+            "effective_date": self.effective_date.isoformat() if self.effective_date else None,
+        }
 
 
 class Alert(Base):
@@ -291,6 +371,29 @@ class ModelPricing(Base):
         OpenAI     — cache_write=0 (automatic), cache_read=50% of input
         Anthropic  — cache_write=125% of input, cache_read=10% of input
         Google     — cache_write=input rate,    cache_read=25% of input
+
+    Billing mode flags
+    ──────────────────
+    audio_billing:
+        "per_minute"  — whisper-1, gpt-4o-transcribe (simple)  → per_minute_rate
+        "per_token"   — gpt-4o-transcribe (token mode), gpt-4o-realtime
+                        → audio_input_per_million / audio_output_per_million
+
+    speech_billing:
+        "per_character" — tts-1, tts-1-hd  → per_1k_chars_rate
+        "per_token"     — gpt-4o-mini-tts  → input_per_million (text in) +
+                          audio_output_per_million (audio out); speech_cost = 0,
+                          cost absorbed by input_cost + audio_cost
+
+    Image pricing (gpt-image-1, gpt-image-1-mini, gpt-image-1.5, gpt-image-2)
+    is always token-based across five dimensions — there is no flat
+    per-image billing mode in the cost engine:
+        image_text_input_per_million         plain text prompt tokens
+        image_cached_text_input_per_million  cached text prompt tokens
+        image_input_per_million              reference-image tokens (edit)
+        image_cached_input_per_million       cached reference-image tokens
+        image_output_per_million             generated-image tokens
+    Unused dimensions for a given model are simply left at 0.
     """
 
     __tablename__ = "model_pricing"
@@ -301,13 +404,46 @@ class ModelPricing(Base):
     provider: str = Column(Text, nullable=False)  # openai | anthropic | google …
     model_id: str = Column(Text, nullable=False)  # canonical model string
 
+    # ── Text token rates (all models) ─────────────────────────────────────────
     input_per_million: float = Column(Numeric(14, 6), nullable=False)
     output_per_million: float = Column(Numeric(14, 6), nullable=False)
-    cache_write_per_million: float = Column(Numeric(14, 6), nullable=False, default=0)
-    cache_read_per_million: float = Column(Numeric(14, 6), nullable=False, default=0)
+    cache_write_per_million: float = Column(Numeric(14, 6), nullable=True, default=0)
+    cache_read_per_million: float = Column(Numeric(14, 6), nullable=True, default=0)
+
+    # ── Billing mode flags ────────────────────────────────────────────────────
+    audio_billing: str = Column(
+        Text, nullable=True, default="per_minute"
+    )  # "per_minute" | "per_token"
+    speech_billing: str = Column(
+        Text, nullable=True, default="per_character"
+    )  # "per_character" | "per_token"
+
+    # ── Modality-specific token rates ─────────────────────────────────────────
+    # Audio: gpt-4o-transcribe (token mode), gpt-4o-realtime, gpt-4o-mini-tts
+    audio_input_per_million: float = Column(Numeric(14, 6), nullable=True, default=0)
+    audio_output_per_million: float = Column(Numeric(14, 6), nullable=True, default=0)
+
+    # Images: gpt-image-1 family — five token dimensions, always per-token
+    image_text_input_per_million: float = Column(
+        Numeric(14, 6), nullable=True, default=0
+    )
+    image_cached_text_input_per_million: float = Column(
+        Numeric(14, 6), nullable=True, default=0
+    )
+    image_input_per_million: float = Column(Numeric(14, 6), nullable=True, default=0)
+    image_cached_input_per_million: float = Column(
+        Numeric(14, 6), nullable=True, default=0
+    )
+    image_output_per_million: float = Column(Numeric(14, 6), nullable=True, default=0)
+
+    # ── Legacy flat rates ─────────────────────────────────────────────────────
+    # Audio transcription / translation: USD per minute (whisper-1, gpt-4o-transcribe simple)
+    per_minute_rate: float = Column(Numeric(14, 6), nullable=True, default=0)
+    # TTS: USD per 1 000 characters (tts-1, tts-1-hd)
+    per_1k_chars_rate: float = Column(Numeric(14, 6), nullable=True, default=0)
 
     # Multiplier applied when is_batch=True (0.5 = 50% off)
-    batch_discount: float = Column(Numeric(5, 4), nullable=False, default=0.5)
+    batch_discount: float = Column(Numeric(5, 4), nullable=True, default=0.5)
 
     # A later effective_from = new price period; old rows stay for audit history
     effective_from: datetime = Column(
@@ -323,27 +459,66 @@ class ModelPricing(Base):
         default=datetime.now(timezone.utc),
         onupdate=datetime.now(timezone.utc),
     )
+    # let user create custom model pricing
+    model_type : str = Column(
+      nullable=False,
+      default = SYSTEM_DEFINED_MODEL
+    )
+    author_id : str = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True,
+    ) 
 
     __table_args__ = (
-        # One price per (provider, model, date) — insert a new row to change price
+        # USER pricing
         UniqueConstraint(
             "provider",
             "model_id",
-            "effective_from",
-            name="uq_pricing_provider_model_date",
+            "model_type",
+            "author_id",
+            name="uq_model_pricing_user",
+        ),
+        # SYSTEM pricing
+        Index(
+            "uq_model_pricing_system",
+            "provider",
+            "model_id",
+            unique=True,
+            postgresql_where=(model_type == "SYSTEM"),
         ),
     )
-
     def to_dict(self) -> dict:
         return {
             "id": self.id,
             "provider": self.provider,
             "model_id": self.model_id,
+            # text token rates
             "input_per_million": float(self.input_per_million),
             "output_per_million": float(self.output_per_million),
             "cache_write_per_million": float(self.cache_write_per_million),
             "cache_read_per_million": float(self.cache_read_per_million),
+            # billing mode flags
+            "audio_billing": self.audio_billing,
+            "speech_billing": self.speech_billing,
+            # modality-specific token rates
+            "audio_input_per_million": float(self.audio_input_per_million),
+            "audio_output_per_million": float(self.audio_output_per_million),
+            "image_text_input_per_million": float(self.image_text_input_per_million),
+            "image_cached_text_input_per_million": float(
+                self.image_cached_text_input_per_million
+            ),
+            "image_input_per_million": float(self.image_input_per_million),
+            "image_cached_input_per_million": float(
+                self.image_cached_input_per_million
+            ),
+            "image_output_per_million": float(self.image_output_per_million),
+            # legacy flat rates
+            "per_minute_rate": float(self.per_minute_rate),
+            "per_1k_chars_rate": float(self.per_1k_chars_rate),
             "batch_discount": float(self.batch_discount),
+            "model_type": str(self.model_type),
+            "author_id" : str(self.author_id),
             "effective_from": (
                 self.effective_from.isoformat() if self.effective_from else None
             ),
@@ -371,6 +546,16 @@ async def get_model_pricing(
                 output_per_million,
                 cache_write_per_million,
                 cache_read_per_million,
+                audio_billing,
+                speech_billing,
+                image_billing,
+                audio_input_per_million,
+                audio_output_per_million,
+                image_input_per_million,
+                image_output_per_million,
+                per_minute_rate,
+                per_1k_chars_rate,
+                per_image_rate,
                 batch_discount
             FROM model_pricing
             WHERE  provider        = :provider

@@ -31,6 +31,27 @@ class ModelRates:
     output_per_million: float  # USD / 1M output tokens
     cache_write_per_million: float = 0.0  # USD / 1M tokens written to cache
     cache_read_per_million: float = 0.0  # USD / 1M tokens read from cache
+
+    # ── billing mode flags ────────────────────────────────────────────────────
+    audio_billing: str = "per_minute"  # "per_minute" | "per_token"
+    speech_billing: str = "per_character"  # "per_character" | "per_token"
+
+    # ── modality-specific token rates ─────────────────────────────────────────
+    # Audio: gpt-4o-transcribe (token mode), gpt-4o-realtime, gpt-4o-mini-tts
+    audio_input_per_million: float = 0.0
+    audio_output_per_million: float = 0.0
+
+    # Images: gpt-image-1 family — five dimensions, always per-token
+    image_text_input_per_million: float = 0.0
+    image_cached_text_input_per_million: float = 0.0
+    image_input_per_million: float = 0.0
+    image_cached_input_per_million: float = 0.0
+    image_output_per_million: float = 0.0
+
+    # ── legacy flat rates ─────────────────────────────────────────────────────
+    per_minute_rate: float = 0.0  # whisper-1, gpt-4o-transcribe simple
+    per_1k_chars_rate: float = 0.0  # tts-1, tts-1-hd
+
     batch_discount: float = 0.5  # multiplier applied when is_batch=True (0.5 = 50% off)
     effective_from: datetime = field(
         default_factory=lambda: datetime(2024, 1, 1, tzinfo=timezone.utc)

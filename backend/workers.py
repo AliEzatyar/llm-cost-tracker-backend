@@ -237,7 +237,7 @@ def start_scheduler() -> None:
     # Hourly rollup
     scheduler.add_job(
         job_rollup_daily,
-        trigger=IntervalTrigger(hours=1),
+        trigger=IntervalTrigger(seconds=100),
         id="rollup_daily",
         name="Rollup raw events to daily table",
         max_instances=1,
@@ -258,7 +258,7 @@ def start_scheduler() -> None:
     # 1-hour project usage snapshot syncing
     scheduler.add_job(
         sync_all_projects,
-        trigger=IntervalTrigger(seconds=100),
+        trigger=IntervalTrigger(seconds=1000),
         id="sync_all_projects_usage_snapshot",
         name="Sync All Project Usage Sanpshot",
         max_instances=1,  # never overlap if the previous run is still going
@@ -268,7 +268,7 @@ def start_scheduler() -> None:
     )
     scheduler.add_job(
         sync_free_projects_usage,
-        trigger=IntervalTrigger(seconds=100),
+        trigger=IntervalTrigger(seconds=1000),
         id="sync_all_free_projects_usage",
         name="Sync All Free Project Usage Sanpshot",
         max_instances=1,  # never overlap if the previous run is still going

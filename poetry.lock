@@ -555,6 +555,25 @@ pycrypto = ["pycrypto (>=2.6.0,<2.7.0)"]
 pycryptodome = ["pycryptodome (>=3.3.1,<4.0.0)"]
 
 [[package]]
+name = "redis"
+version = "8.0.0"
+description = "Python client for Redis database and key-value store"
+category = "main"
+optional = false
+python-versions = ">=3.10"
+
+[package.dependencies]
+async-timeout = {version = ">=4.0.3", markers = "python_full_version < \"3.11.3\""}
+
+[package.extras]
+circuit-breaker = ["pybreaker (>=1.4.0)"]
+hiredis = ["hiredis (>=3.2.0)"]
+jwt = ["pyjwt (>=2.12.0)"]
+ocsp = ["cryptography (>=36.0.1)", "pyopenssl (>=20.0.1)", "requests (>=2.31.0)"]
+otel = ["opentelemetry-api (>=1.39.1)", "opentelemetry-exporter-otlp-proto-http (>=1.39.1)", "opentelemetry-sdk (>=1.39.1)"]
+xxhash = ["xxhash (>=3.6.0,<3.7.0)"]
+
+[[package]]
 name = "requests"
 version = "2.34.2"
 description = "Python HTTP for Humans."
@@ -773,7 +792,7 @@ dev = ["pytest", "setuptools"]
 [metadata]
 lock-version = "1.1"
 python-versions = "^3.10"
-content-hash = "669fe070d21c8d9c1f008490e3eb8fd818754929973917ecbcc02a6dcf7644b4"
+content-hash = "28b8181ccc8f09d402e64525be8166c829c4e91d7db6460966d394ce9a22d565"
 
 [metadata.files]
 alembic = []
@@ -819,6 +838,7 @@ pydantic-core = []
 pytest = []
 python-dotenv = []
 python-jose = []
+redis = []
 requests = []
 rsa = []
 six = []

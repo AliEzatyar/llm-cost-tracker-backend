@@ -12,22 +12,32 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, text
+from backend import redis_client
 from backend.auth.services import get_current_user
+from backend.dashboard.schemas import (
+    CreateProjectRequest,
+    CreateProjectResponse,
+    UpdateProjectRequest,
+)
 from backend.dashboard.services import (
     CostService,
 )
+from fastapi import APIRouter, Depends, Query, HTTPException
+from sqlalchemy import select
+
 from backend.database.database import get_db
 from backend.database.models import (
     Alert,
     Project,
     Threshold,
     User,
+    get_free_plan_project,
     get_project_by_api_key,
 )
-from backend.configs import (
+from backend.sdk_api.schemas import (
     ThresholdIn,
 )
-from backend.configs import limiter
+from backend.configs import get_redis, limiter
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -43,7 +53,9 @@ def _require_user(request: Request) -> str:
     return user_id
 
 
-# ── GET /costs ────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
+# GET costs in dashboard
+# ──────────────────────────────────────────────────────────────────
 
 
 @router.get("/costs", tags=["costs"])
@@ -61,7 +73,9 @@ async def list_costs(
     return {"project_id": project_id, "rows": rows, "count": len(rows)}
 
 
-# ── GET /costs/export/csv ─────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
+# GET /costs/export/csv
+# ───────────────────────────────────────────────────────
 # IMPORTANT: this route must be declared BEFORE /costs/{tenant_id} so that
 # FastAPI does not treat "export" as a tenant_id path segment.
 
@@ -102,7 +116,9 @@ async def export_costs_csv(
     )
 
 
-# ── GET /costs/{tenant_id} ──────────────────────────────────────────────────
+# ────────────────────────────────────────────────────
+# Per tenants costs
+# ────────────────────────────────────────────────────
 
 
 @router.get("/costs/{tenant_id}", tags=["costs"])
@@ -122,7 +138,18 @@ async def get_customer_costs(
     )
 
 
-# ── POST /thresholds ──────────────────────────────────────────────────────────
+import logging
+import uuid
+
+from fastapi import APIRouter, Depends, Request
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
+
+# ────────────────────────────────────────────────────────────
+# Set thresholds
+# ────────────────────────────────────────────────────────────
 
 
 @router.post("/thresholds", status_code=201, tags=["alerts"])
@@ -131,6 +158,7 @@ async def set_threshold(
     request: Request,
     body: ThresholdIn,
     db: AsyncSession = Depends(get_db),
+    redis_client=Depends(get_redis),
 ):
     """Create or update a monthly spend threshold for a customer."""
 
@@ -150,16 +178,25 @@ async def set_threshold(
             "limit_usd": body.limit_usd,
         },
     )
+
+    # Invalidate the cache so check-tenant-limit picks up the new limit
+    # immediately instead of waiting out THRESHOLD_CACHE_TTL. Soft-fail:
+    # a stale entry self-heals within the TTL anyway, so a Redis hiccup
+    # here shouldn't turn a successful write into a 500.
+    try:
+        await redis_client.delete(f"thr:{body.project_id}:{body.tenant_id}")
+    except Exception:
+        logger.warning(
+            "failed to invalidate threshold cache for tenant_id=%s",
+            body.tenant_id,
+            exc_info=True,
+        )
+
     return {
         "project_id": body.project_id,
         "tenant_id": body.tenant_id,
         "limit_usd": body.limit_usd,
     }
-
-
-from fastapi import APIRouter, Depends, Query, HTTPException
-from sqlalchemy.orm import Session
-from sqlalchemy import select
 
 
 @router.get("/thresholds", tags=["alerts"])
@@ -194,7 +231,9 @@ async def list_thresholds(
     ]
 
 
-# ── PUT /thresholds/{threshold_id} ────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+# PUT /thresholds/{threshold_id}
+# ─────────────────────────────────────────────────────────────────────
 
 
 class UpdateThresholdRequest(BaseModel):
@@ -225,10 +264,19 @@ async def update_threshold(
         raise HTTPException(status_code=404, detail="Threshold not found")
 
     threshold.limit_usd = body.limit_usd
+    threshold.effective_date = datetime.fromisoformat(body.effective_date)
+    threshold.frequency = body.frequency
     threshold.updated_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(threshold)
+    try:
 
+        await redis_client.delete(
+            f"thr:{threshold.project_id}:{threshold.tenant_id}"
+        )
+        print("update...........................")
+    except:
+        logger.warning("unable to update threshold from cache")
     return {
         "id": threshold.id,
         "project_id": threshold.project_id,
@@ -237,7 +285,9 @@ async def update_threshold(
     }
 
 
-# ── DELETE /thresholds/{threshold_id} ────────────────────────────────────────
+# ────────────────────────────────────────────────────────
+# DELETE /thresholds/{threshold_id}
+# ────────────────────────────────────────────────────────
 
 
 @router.delete("/thresholds/{threshold_id}", status_code=204, tags=["alerts"])
@@ -272,11 +322,17 @@ async def delete_threshold(
     )
     await db.delete(threshold)
     await db.commit()
+    try:
+        await redis_client.delete(
+            f"thr:{threshold.project_id}:{threshold.tenant_id}"
+        )
+    except:
+        logger.warning("unable to delete threshold from cache")
 
 
-# ── GET /alerts ───────────────────────────────────────────────────────────────
-
-
+# ────────────────────────────────────────────────────────
+# Alerts
+# ────────────────────────────────────────────────────────
 @router.get("/alerts", tags=["alerts"])
 @limiter.limit("1000/minute")
 async def list_alerts(
@@ -306,26 +362,9 @@ async def list_alerts(
     return {"project_id": project_id, "alerts": rows}
 
 
-# ── Project schemas ───────────────────────────────────────────────────────────
-
-
-class CreateProjectRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=120)
-    # Plan is informational only at creation time — every new project starts
-    # on "free" regardless of what's sent here. Upgrading to a paid plan
-    # requires a Stripe Checkout session (POST /billing/checkout), since a
-    # paid plan with no Stripe subscription would be an inconsistent state.
-
-
-class CreateProjectResponse(BaseModel):
-    id: str
-    name: str
-    plan: str
-    api_key: str  # raw key — shown ONCE, never stored
-    created_at: datetime
-
-
-# ── GET /projects ─────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────
+# List Projects
+# ────────────────────────────────────────────────────────
 
 
 @router.get("/projects")
@@ -354,7 +393,9 @@ async def list_projects(
     ]
 
 
-# ── POST /create-project ──────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────
+# Create Project
+# ────────────────────────────────────────────────────────
 
 
 @router.post(
@@ -401,6 +442,13 @@ async def create_project(
             detail="Key generation collision — please retry.",
         )
 
+    # guard against free plan not exceed 1 project
+    free = await get_free_plan_project(db, owner_id)
+    if free:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="You cannot have more than 1 free project. Upgrade existing project.",
+        )
     project_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
 
@@ -437,19 +485,9 @@ async def create_project(
     )
 
 
-class UpdateProjectRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=120)
-    # Plan is intentionally NOT editable here. Changing plans has billing
-    # consequences (Stripe subscription create/upgrade/downgrade) and must
-    # go through the /billing endpoints:
-    #   free -> paid   : POST /billing/checkout
-    #   paid -> paid   : POST /billing/change-plan
-    #   paid -> free   : POST /billing/cancel
-
-
-# ------------------------ update projecy -----------------------
-
-
+# ────────────────────────────────────────────────────────
+# Update Project
+# ────────────────────────────────────────────────────────
 @router.put("/projects/{project_id}", tags=["projects"])
 async def update_project(
     project_id: uuid.UUID,
@@ -482,7 +520,9 @@ async def update_project(
     }
 
 
-# ------------------------------ delete project -------------------------------
+# ────────────────────────────────────────────────────────
+# Delete Project
+# ────────────────────────────────────────────────────────
 
 
 @router.delete("/projects/{project_id}", status_code=204, tags=["projects"])

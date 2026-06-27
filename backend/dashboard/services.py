@@ -17,6 +17,8 @@ from backend.configs import (
     SMTP_PASS,
     SMTP_PORT,
     SMTP_USER,
+)
+from ..sdk_api.schemas import (
     CostEventIn,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,17 +34,36 @@ class CostService:
         self.session = session
 
     async def write_event(
-        self, project_id: str, event: CostEventIn, cost_usd: int
+        self, project_id: str, event: CostEventIn, cost_usd: float
     ) -> dict:
         event_id = str(uuid.uuid4())
         await self.session.execute(
             text("""
-                INSERT INTO cost_events
-                    (id, project_id, tenant_id, model,
-                     input_tokens, output_tokens, cost_usd, created_at)
-                VALUES
-                    (:id, :project_id, :tenant_id, :model,
-                     :input_tokens, :output_tokens, :cost_usd, NOW())
+                INSERT INTO cost_events (
+                    id, project_id, tenant_id,
+                    provider, endpoint, model,
+                    input_tokens, cached_tokens, output_tokens, total_tokens,
+                    audio_input_tokens, audio_output_tokens,
+                    duration_seconds,
+                    character_count,
+                    input_text_tokens, cached_input_text_tokens,
+                    input_image_tokens, cached_input_image_tokens,
+                    output_image_tokens,
+                    image_count,
+                    cost_usd, created_at
+                ) VALUES (
+                    :id, :project_id, :tenant_id,
+                    :provider, :endpoint, :model,
+                    :input_tokens, :cached_tokens, :output_tokens, :total_tokens,
+                    :audio_input_tokens, :audio_output_tokens,
+                    :duration_seconds,
+                    :character_count,
+                    :input_text_tokens, :cached_input_text_tokens,
+                    :input_image_tokens, :cached_input_image_tokens,
+                    :output_image_tokens,
+                    :image_count,
+                    :cost_usd, NOW()
+                )
             """),
             {
                 "id": event_id,
@@ -52,16 +73,26 @@ class CostService:
             },
         )
         return {"id": event_id, "status": "accepted"}
+
     async def get_by_tenant(
-            self,
-            project_id: str,
-            date_from: date | None = None,
-            date_to: date | None = None,
-        ) -> list[dict]:
-        """Return daily rollup rows for all customers in this project.
-        Joins cost_events to include total token counts (input + output)
-        per customer per day, which are not stored in customer_cost_daily.
-        Also includes each tenant's configured limit_usd from thresholds, if any.
+        self,
+        project_id: str,
+        date_from: date | None = None,
+        date_to: date | None = None,
+    ) -> list[dict]:
+        """
+        Daily rollup for all tenants in a project.
+
+        Returns one row per (tenant_id, date) with:
+          • cost and call count from the pre-aggregated customer_cost_daily table
+          • token breakdown summed live from cost_events, split by modality:
+              text tokens  — input / cached / output / total
+              audio tokens — audio_input / audio_output / duration_seconds
+              speech       — character_count
+              image tokens — input_text / cached_input_text /
+                             input_image / cached_input_image / output_image
+              image audit  — image_count
+          • the tenant's configured spend limit from thresholds (if set)
         """
         filters = ["ccd.project_id = :project_id"]
         params: dict = {"project_id": project_id}
@@ -81,25 +112,54 @@ class CostService:
                     ccd.date,
                     ccd.total_cost_usd,
                     ccd.total_calls,
-                    COALESCE(SUM(ce.input_tokens), 0)  AS total_input_tokens,
-                    COALESCE(SUM(ce.output_tokens), 0) AS total_output_tokens,
-                    COALESCE(SUM(ce.input_tokens + ce.output_tokens), 0) AS total_tokens,
+ 
+                    -- text tokens
+                    COALESCE(SUM(ce.input_tokens),  0)                          AS total_input_tokens,
+                    COALESCE(SUM(ce.cached_tokens), 0)                          AS total_cached_tokens,
+                    COALESCE(SUM(ce.output_tokens), 0)                          AS total_output_tokens,
+                    COALESCE(SUM(ce.total_tokens),  0)                          AS total_tokens,
+ 
+                    -- audio tokens (gpt-4o-transcribe token mode, realtime)
+                    COALESCE(SUM(ce.audio_input_tokens),  0)                    AS total_audio_input_tokens,
+                    COALESCE(SUM(ce.audio_output_tokens), 0)                    AS total_audio_output_tokens,
+ 
+                    -- audio flat billing (whisper-1)
+                    COALESCE(SUM(ce.duration_seconds), 0)                       AS total_duration_seconds,
+ 
+                    -- speech flat billing (tts-1)
+                    COALESCE(SUM(ce.character_count), 0)                        AS total_character_count,
+ 
+                    -- image tokens (gpt-image-*)
+                    COALESCE(SUM(ce.input_text_tokens),         0)              AS total_input_text_tokens,
+                    COALESCE(SUM(ce.cached_input_text_tokens),  0)              AS total_cached_input_text_tokens,
+                    COALESCE(SUM(ce.input_image_tokens),        0)              AS total_input_image_tokens,
+                    COALESCE(SUM(ce.cached_input_image_tokens), 0)              AS total_cached_input_image_tokens,
+                    COALESCE(SUM(ce.output_image_tokens),       0)              AS total_output_image_tokens,
+ 
+                    -- image audit
+                    COALESCE(SUM(ce.image_count), 0)                            AS total_image_count,
+ 
+                    -- spend limit
                     th.limit_usd
                 FROM   customer_cost_daily ccd
                 LEFT JOIN cost_events ce
-                    ON  ce.project_id = ccd.project_id
-                    AND ce.tenant_id  = ccd.tenant_id
+                    ON  ce.project_id    = ccd.project_id
+                    AND ce.tenant_id     = ccd.tenant_id
                     AND ce.created_at::date = ccd.date
                 LEFT JOIN thresholds th
                     ON  th.project_id = ccd.project_id
                     AND th.tenant_id  = ccd.tenant_id
                 WHERE  {where}
-                GROUP  BY ccd.tenant_id, ccd.date, ccd.total_cost_usd, ccd.total_calls, th.limit_usd
+                GROUP  BY
+                    ccd.tenant_id, ccd.date,
+                    ccd.total_cost_usd, ccd.total_calls,
+                    th.limit_usd
                 ORDER  BY ccd.date DESC, ccd.total_cost_usd DESC
             """),
             params,
         )
         return [dict(r) for r in result.mappings()]
+
     async def get_customer_breakdown(
         self,
         project_id: str,
@@ -107,10 +167,16 @@ class CostService:
         date_from: date | None = None,
         date_to: date | None = None,
     ) -> dict:
-        """Return per-model breakdown for a single customer from raw events."""
+        """
+        Per-model breakdown for a single tenant from raw events.
+
+        Each row in ``breakdown`` represents one model used by the tenant and
+        carries the full token breakdown across all billing modalities, so the
+        B2B owner can see exactly what drove cost for each model.
+        """
         filters = [
             "project_id = :project_id",
-            "tenant_id = :tenant_id",
+            "tenant_id  = :tenant_id",
         ]
         params: dict = {"project_id": project_id, "tenant_id": tenant_id}
 
@@ -128,35 +194,79 @@ class CostService:
             text(f"""
                 SELECT
                     model,
-                    SUM(input_tokens)                       AS input_tokens,
-                    SUM(output_tokens)                      AS output_tokens,
-                    SUM(input_tokens + output_tokens)       AS total_tokens,
-                    SUM(cost_usd)                           AS total_cost_usd,
-                    COUNT(*)                                AS total_calls
+                    endpoint,
+ 
+                    -- text tokens
+                    SUM(input_tokens)   AS input_tokens,
+                    SUM(cached_tokens)  AS cached_tokens,
+                    SUM(output_tokens)  AS output_tokens,
+                    SUM(total_tokens)   AS total_tokens,
+ 
+                    -- audio tokens
+                    SUM(audio_input_tokens)  AS audio_input_tokens,
+                    SUM(audio_output_tokens) AS audio_output_tokens,
+ 
+                    -- audio flat
+                    SUM(duration_seconds)    AS duration_seconds,
+ 
+                    -- speech flat
+                    SUM(character_count)     AS character_count,
+ 
+                    -- image tokens
+                    SUM(input_text_tokens)          AS input_text_tokens,
+                    SUM(cached_input_text_tokens)   AS cached_input_text_tokens,
+                    SUM(input_image_tokens)         AS input_image_tokens,
+                    SUM(cached_input_image_tokens)  AS cached_input_image_tokens,
+                    SUM(output_image_tokens)        AS output_image_tokens,
+ 
+                    -- image audit
+                    SUM(image_count)   AS image_count,
+ 
+                    -- cost and call count
+                    SUM(cost_usd)      AS total_cost_usd,
+                    COUNT(*)           AS total_calls
                 FROM  cost_events
                 WHERE {where}
-                GROUP BY model
+                GROUP BY model, endpoint
                 ORDER BY total_cost_usd DESC
             """),
             params,
         )
         rows = [dict(r) for r in result.mappings()]
-        total = sum(float(r["total_cost_usd"]) for r in rows)
+
+        total_cost = sum(float(r["total_cost_usd"]) for r in rows)
         total_input = sum(int(r["input_tokens"] or 0) for r in rows)
+        total_cached = sum(int(r["cached_tokens"] or 0) for r in rows)
         total_output = sum(int(r["output_tokens"] or 0) for r in rows)
+        total_audio_in = sum(int(r["audio_input_tokens"] or 0) for r in rows)
+        total_audio_out = sum(int(r["audio_output_tokens"] or 0) for r in rows)
+        total_img_out = sum(int(r["output_image_tokens"] or 0) for r in rows)
+        total_images = sum(int(r["image_count"] or 0) for r in rows)
+
         return {
             "tenant_id": tenant_id,
-            "total_cost_usd": total,
+            "total_cost_usd": total_cost,
+            # text
             "total_input_tokens": total_input,
+            "total_cached_tokens": total_cached,
             "total_output_tokens": total_output,
             "total_tokens": total_input + total_output,
+            # audio
+            "total_audio_input_tokens": total_audio_in,
+            "total_audio_output_tokens": total_audio_out,
+            # image
+            "total_output_image_tokens": total_img_out,
+            "total_images_generated": total_images,
             "breakdown": rows,
         }
 
     async def rollup_daily(self, project_id: str | None = None) -> int:
         """
-        Upsert yesterday's raw events into customer_cost_daily.
-        Returns the number of rows upserted.
+        Upsert events from the last 24 hours (relative to job run time) into
+        customer_cost_daily, bucketed by calendar date. Safe to run repeatedly
+        (e.g. hourly) — re-aggregates and overwrites any existing rows for the
+        dates touched by the window, so partial-day totals get corrected as
+        more events land.
         """
         project_filter = "AND project_id = :project_id" if project_id else ""
         params: dict = {}
@@ -171,10 +281,12 @@ class CostService:
                     gen_random_uuid(),
                     project_id,
                     tenant_id,
-                    created_at::date        AS date,
-                    SUM(cost_usd)           AS total_cost_usd,
-                    COUNT(*)                AS total_calls
+                    created_at::date   AS date,
+                    SUM(cost_usd)      AS total_cost_usd,
+                    COUNT(*)           AS total_calls
                 FROM  cost_events
+                WHERE created_at >= NOW() - INTERVAL '24 hours'
+                AND created_at <= NOW()
                 {project_filter}
                 GROUP BY project_id, tenant_id, created_at::date
                 ON CONFLICT (project_id, tenant_id, date)
@@ -317,4 +429,3 @@ class AlertService:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.post(ALERT_WEBHOOK_URL, json=payload)
             resp.raise_for_status()
-

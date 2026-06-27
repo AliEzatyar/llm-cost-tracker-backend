@@ -53,16 +53,7 @@ PLANS: dict[str, Plan] = {
         monthly_price_usd=299.0,
         stripe_price_id_monthly=os.getenv("STRIPE_PRICE_SCALE_MONTHLY"),
         stripe_price_id_annual=os.getenv("STRIPE_PRICE_SCALE_ANNUAL"),
-    ),
-    "enterprise": Plan(
-        key="enterprise",
-        display_name="Enterprise",
-        tracked_spend_limit_usd=None,  # unlimited
-        monthly_price_usd=0.0,  # custom / invoiced
-        stripe_price_id_monthly=None,
-        stripe_price_id_annual=None,
-        grace_period_days=30,
-    ),
+    )
 }
 
 

@@ -64,13 +64,13 @@ async def get_subscription(request: Request, db: AsyncSession = Depends(get_db))
     if not project:
         raise HTTPException(status_code=400, detail="No project selected.")
 
-    sub = await services.get_subscription(db, project["id"])
+    sub = await services.get_subscription(db, project.id)
     if not sub:
         now = datetime.now(timezone.utc)
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         result = await db.execute(
             select(func.coalesce(func.sum(CustomerCostDaily.total_cost_usd), 0))
-            .where(CustomerCostDaily.project_id == project["id"])
+            .where(CustomerCostDaily.project_id == project.id)
             .where(CustomerCostDaily.date >= month_start.date())
         )
         tracked_free_plan_spend = float(result.scalar())
@@ -79,7 +79,7 @@ async def get_subscription(request: Request, db: AsyncSession = Depends(get_db))
 
         # FIX: read is_blocked from DB (set by worker) rather than
         # recalculating — keeps router and worker in sync.
-        is_blocked = await services.is_project_blocked(db, project["id"])
+        is_blocked = await services.is_project_blocked(db, project.id)
 
         return SubscriptionResponse(
             plan="free",
@@ -165,7 +165,6 @@ async def create_checkout(
         project = await get_current_project(db, request)
         if not project:
             raise HTTPException(status_code=400, detail="No project selected.")
-
     user_email = current_user.email
     url = await services.create_upgrade_checkout(
         session=db,
@@ -215,7 +214,7 @@ async def change_plan(
         raise HTTPException(status_code=400, detail="No project selected.")
 
     try:
-        sub = await services.change_plan(db, project["id"], body.plan)
+        sub = await services.change_plan(db, project.id, body.plan)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -241,7 +240,7 @@ async def cancel_subscription(
         raise HTTPException(status_code=400, detail="No project selected.")
 
     try:
-        await services.request_cancel(db, project["id"])
+        await services.request_cancel(db, project.id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"detail": "Subscription will cancel at the end of the current period."}
