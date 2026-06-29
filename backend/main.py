@@ -11,6 +11,8 @@ Run:
 
 from contextlib import asynccontextmanager
 
+from sqlalchemy.exc import IntegrityError
+
 from .database.models import (
     get_project_by_api_key,
 )
@@ -54,12 +56,30 @@ async def lifespan(app: FastAPI):
     # Start background scheduler (imported here to avoid circular imports)
     from .workers import start_scheduler
     start_scheduler()
+    try:
+        await create_all_tables()
+    except IntegrityError as e:
+        if "duplicate key value" in str(e):
+            logger.info(
+                "Database tables already created by a concurrent worker thread."
+            )
+        else:
+            raise e
     logger.info("Background scheduler started.")
     app.state.redis = create_redis_client()
     yield
     await app.state.redis.aclose()
+    import logging
 
-app = FastAPI(lifespan=lifespan,title="Cost Tracker API", version="1.0.0")
+
+app = FastAPI(
+    lifespan=lifespan,
+    title="Cost Tracker API",
+    version="1.0.0",
+    openapi_url="/api/openapi.json",  # Forces Swagger to fetch schema from the proxy route
+    docs_url="/api/docs",  # Aligns the internal documentation framework route
+)
+
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
@@ -169,7 +189,7 @@ from sqlalchemy import text
 async def startup():
     logger.info("Database tables verified / created.")
     # await drop_all_tables()
-    # await create_all_tables()
+    await create_all_tables()
     # Start background scheduler (imported here to avoid circular imports)
     from .workers import start_scheduler
 

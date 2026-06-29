@@ -2,10 +2,11 @@
 Thin wrapper around the Stripe SDK.
 All raw Stripe calls live here — services never import stripe directly.
 """
-
+from dotenv import load_dotenv
 import os
 import stripe
 
+load_dotenv
 stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
 WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
 
@@ -13,7 +14,7 @@ WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
 # ---------------------------------------------------------------------------
 # Customer
 # ---------------------------------------------------------------------------
-
+    
 
 def create_customer(email: str, project_id: str, name: str) -> stripe.Customer:
     return stripe.Customer.create(

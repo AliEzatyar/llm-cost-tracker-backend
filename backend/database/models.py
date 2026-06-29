@@ -459,10 +459,10 @@ class ModelPricing(Base):
         default=datetime.now(timezone.utc),
         onupdate=datetime.now(timezone.utc),
     )
-    # let user create custom model pricing
-    model_type : str = Column(
-      nullable=False,
-      default = SYSTEM_DEFINED_MODEL
+    model_type = Column(
+        String(100),  # <-- FIX: Define the explicit database type here
+        nullable=False,
+        default=SYSTEM_DEFINED_MODEL,
     )
     author_id : str = Column(
         UUID(as_uuid=False),
