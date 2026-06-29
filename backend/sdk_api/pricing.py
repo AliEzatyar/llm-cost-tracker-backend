@@ -334,14 +334,95 @@ def infer_provider(model_id: str) -> Optional[str]:
     Returns None if ambiguous.
     """
     m = model_id.lower()
-    if m.startswith(("gpt-", "o1", "o3", "o4", "text-embedding", "dall-e")):
+
+    # ── Core Model Developers ────────────────────────────────────────────────
+
+    # OpenAI: GPT, O-series reasoning, embeddings, DALL-E, Whisper, TTS
+    if m.startswith(
+        (
+            "gpt-",
+            "o1-",
+            "o3-",
+            "o4-",
+            "text-embedding",
+            "text-davinci",
+            "text-curie",
+            "text-babbage",
+            "text-ada",
+            "dall-e",
+            "whisper",
+            "tts-",
+            "chatgpt",
+        )
+    ) or m in ("o1", "o3", "o4"):
         return "openai"
+
+    # Anthropic: Claude family
     if m.startswith("claude"):
         return "anthropic"
-    if m.startswith("gemini"):
+
+    # Google: Gemini, PaLM, Bard, Imagen
+    if m.startswith(
+        ("gemini", "palm", "bard", "imagen", "gecko", "text-bison", "chat-bison")
+    ):
         return "google"
-    if m.startswith(("mistral", "codestral", "mixtral")):
+
+    # Meta: Llama family (llama-2, llama-3, llama3, code-llama, …)
+    if m.startswith(("llama", "codellama", "meta-llama", "meta/")):
+        return "meta"
+
+    # Mistral AI: Mistral, Mixtral, Codestral, Mathstral, Pixtral
+    if m.startswith(("mistral", "mixtral", "codestral", "mathstral", "pixtral")):
         return "mistral"
-    if m.startswith("command"):
+
+    # Cohere: Command, Embed, Rerank, Aya
+    if m.startswith(("command", "embed-", "rerank-", "aya")):
         return "cohere"
+
+    # DeepSeek
+    if m.startswith("deepseek"):
+        return "deepseek"
+
+    # ── Cloud Platforms & Managed Services ──────────────────────────────────
+
+    # Azure OpenAI: typically prefixed or routed via azure/
+    if m.startswith(("azure/", "azure-")):
+        return "azure"
+
+    # AWS Bedrock: amazon.*, anthropic.*, meta.*, mistral.* on Bedrock ARN style
+    if m.startswith(("aws/", "bedrock/", "amazon.", "us.amazon", "eu.amazon")):
+        return "aws"
+
+    # ── High-Speed & Low-Cost Inference Providers ────────────────────────────
+
+    # Groq: often prefixed groq/ or model IDs served by Groq
+    if m.startswith(("groq/", "groq-")):
+        return "groq"
+
+    # Together AI
+    if m.startswith(("together/", "togethercomputer/", "together-")):
+        return "together"
+
+    # Replicate: namespace/model-name format
+    if m.startswith("replicate/") or m.count("/") >= 1 and m.startswith("replicate"):
+        return "replicate"
+
+    # Fireworks AI
+    if m.startswith(("fireworks/", "fireworks-", "accounts/fireworks")):
+        return "fireworks"
+
+    # OpenRouter: openrouter/ prefix or openrouter.ai paths
+    if m.startswith(("openrouter/", "openrouter-")):
+        return "openrouter"
+
+    # Hugging Face: huggingface/ or hf/ or org/model hub style
+    if m.startswith(("huggingface/", "hf/", "hugging-face")):
+        return "huggingface"
+
+    # ── Local Execution ──────────────────────────────────────────────────────
+
+    # Ollama: ollama/ prefix or ollama: URI scheme
+    if m.startswith(("ollama/", "ollama:", "ollama-")):
+        return "ollama"
+
     return None

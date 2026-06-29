@@ -150,7 +150,7 @@ async def ingest_cost_event(
     for ev in events.events:
         from ..sdk_api.pricing import infer_provider
         print("event:::",ev.total_tokens)
-        provider = infer_provider(ev.model) or "unknown"
+        provider = infer_provider(ev.model) or ev.provider or "unknown"
         tenant_id = ev.tenant_id
         db_rates = await _fetch_db_rates(db, provider, ev.model,request.state.user_id)
         breakdown = calculate_cost(
