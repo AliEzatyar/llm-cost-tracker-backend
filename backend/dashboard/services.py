@@ -23,8 +23,24 @@ from ..sdk_api.schemas import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
+from .streams import StreamEnqueueError, enqueue_cost_event
 
 logger = logging.getLogger(__name__)
+
+# How long an in-flight dedup reservation lives before XADD has confirmed
+# success. Short on purpose: it only needs to cover the XADD call itself
+# plus ordinary scheduling jitter, NOT the full client retry window. If the
+# process crashes between the SETNX and the XADD attempt (so the
+# except/cleanup block in enqueue_event never runs), this is how long a
+# legitimate retry would otherwise be wrongly treated as a duplicate.
+_RESERVATION_TTL_SECONDS = 30
+
+# Full dedup window once an event is confirmed durably queued (XADD
+# succeeded). Long enough to cover realistic client retry windows (SDK
+# retries are a handful of attempts over seconds, not hours), short enough
+# that this key set never becomes a second unbounded dataset alongside the
+# stream itself.
+DEDUP_TTL_SECONDS = 24 * 3600
 
 
 class CostService:
@@ -33,10 +49,174 @@ class CostService:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def write_event(
-        self, project_id: str, event: CostEventIn, cost_usd: float
+    async def enqueue_event(
+        self,
+        redis_client,
+        project_id: str,
+        event: CostEventIn,
+        cost_usd: float,
     ) -> dict:
-        event_id = str(uuid.uuid4())
+        """
+        Durable-queue path: no longer writes to Postgres directly.
+
+        Idempotency: uses the *client-supplied* event.event_id (the SDK's
+        LLMEvent.event_id, generated once at capture time in the SDK
+        process) rather than minting a new UUID per request. This is
+        what makes client-side retries safe — the SDK's HttpClient can
+        retry the same batch on a 500/timeout without knowing whether the
+        prior attempt actually landed, because resending the same
+        event_id is a no-op here rather than a duplicate.
+
+        Dedup is enforced with a short-lived SET NX guard *before* the
+        XADD and *before* apply_cost_to_cache. Without this, a retried
+        request would still pass _fetch_db_rates/calculate_cost again
+        (harmless — pure computation) but would XADD a second stream
+        message and increment the live Redis cost cache a second time,
+        which double-counts the tenant's budget even if the worker's
+        ON CONFLICT DO NOTHING later dedupes the Postgres row. The
+        Postgres-side ON CONFLICT is a second line of defense for the
+        case where this guard's TTL has already expired by the time a
+        very late retry arrives — not the primary mechanism.
+
+        Ordering matters here: the dedup key is *reserved* with SET NX
+        before the XADD (so two concurrent requests for the same
+        event_id can't both pass the check and both enqueue), but it is
+        only left in place if the XADD actually succeeds. If XADD raises
+        StreamEnqueueError (e.g. Redis OOM-rejected the write under
+        maxmemory+noeviction), the reservation is deleted before
+        re-raising. Without that cleanup, a transient XADD failure would
+        permanently "claim" the event_id in the dedup guard — the event
+        was never actually queued, but every future retry (including the
+        SDK's own automatic 5xx retry) would be silently dropped as a
+        duplicate forever. That converts a transient infra failure into
+        permanent, silent data loss for that event, which is exactly
+        what this guard exists to prevent, not cause.
+
+        The reservation is intentionally created with a SHORT TTL
+        (_RESERVATION_TTL_SECONDS) rather than the full 24h dedup window,
+        and is only extended to the full window via EXPIRE after XADD
+        has actually succeeded. This bounds the one remaining gap: if the
+        process is killed (OOM-killed pod, hard crash) between the SETNX
+        and the XADD call, there's no exception handler to run cleanup —
+        the `except StreamEnqueueError` block never executes. With a
+        short initial TTL, that orphaned reservation self-expires in
+        seconds and a retry is allowed through almost immediately. With
+        the old approach (reserving directly at the full 24h TTL), the
+        same crash would silently block that event_id's retries for up
+        to a day. The extend-on-success step trades a narrow, best-effort
+        risk for that benefit: if the EXPIRE call itself fails right
+        after a successful XADD (e.g. a connection drop in that instant),
+        the reservation keeps its short TTL and a retry within the next
+        ~_RESERVATION_TTL_SECONDS could re-enqueue a duplicate — accepted,
+        since the worker's ON CONFLICT DO NOTHING is the backstop for
+        that specific edge case, same as for any very-late retry past the
+        normal dedup window.
+
+        Without this guard, a retried request would still pass
+        _fetch_db_rates/calculate_cost again (harmless — pure computation)
+        but would XADD a second stream message and increment the live
+        Redis cost cache a second time, which double-counts the tenant's
+        budget even if the worker's ON CONFLICT DO NOTHING later dedupes
+        the Postgres row. The Postgres-side ON CONFLICT is a second line
+        of defense for the case where this guard's TTL has already
+        expired by the time a very late retry arrives — not the primary
+        mechanism.
+
+        Falls back to minting a server-side UUID only if the client
+        didn't supply one, for backward compatibility with older SDK
+        versions that predate event_id-based idempotency.
+        """
+        event_id = getattr(event, "event_id", None) or str(uuid.uuid4())
+
+        dedup_key = f"ingest:dedup:{project_id}:{event_id}"
+        # NX = only set if absent; this is the atomic "have we seen this
+        # event_id before" check. Reserve at a SHORT ttl first — just
+        # long enough to cover the XADD call itself plus normal
+        # scheduling jitter — so that if the process dies before we ever
+        # reach the success path below, the reservation expires quickly
+        # instead of blocking retries for the full dedup window. Bumped
+        # up to the real 24h window only once XADD has confirmed success.
+        is_new = await redis_client.set(
+            dedup_key, "1", nx=True, ex=_RESERVATION_TTL_SECONDS
+        )
+        if not is_new:
+            logger.info(
+                "duplicate ingest event_id=%s project_id=%s — skipping XADD and cache update",
+                event_id,
+                project_id,
+            )
+            return {"id": event_id, "status": "duplicate_ignored"}
+
+        payload = {"id": event_id, "project_id": project_id, **event.model_dump()}
+
+        try:
+            await enqueue_cost_event(
+                redis_client,
+                event_id=event_id,
+                project_id=project_id,
+                event_payload=payload,
+                cost_usd=cost_usd,
+            )
+        except StreamEnqueueError:
+            # The reservation above claimed this event_id in the dedup
+            # guard, but the write never actually landed on the stream.
+            # Release the reservation so a retry (client-driven or the
+            # SDK's own 5xx retry) is treated as a fresh attempt rather
+            # than a duplicate — otherwise this event is lost forever.
+            # Best-effort: if the DELETE itself fails, log loudly, but
+            # note the reservation is still only at the short TTL, so it
+            # self-heals soon regardless of whether this DELETE succeeds.
+            try:
+                await redis_client.delete(dedup_key)
+            except Exception:
+                logger.error(
+                    "failed to release dedup reservation for event_id=%s "
+                    "project_id=%s after XADD failure — will self-expire "
+                    "in ~%ss since the reservation is still short-lived",
+                    event_id,
+                    project_id,
+                    _RESERVATION_TTL_SECONDS,
+                )
+            raise
+
+        # XADD succeeded — extend the reservation from the short
+        # crash-bounding TTL to the full dedup window. Best-effort: if
+        # this EXPIRE call fails, the key just keeps its short TTL and
+        # expires early, which only risks a duplicate within that short
+        # window (caught by Postgres's ON CONFLICT DO NOTHING), not data
+        # loss — so we log and continue rather than failing the request
+        # for an event that's already durably queued.
+        try:
+            await redis_client.expire(dedup_key, DEDUP_TTL_SECONDS)
+        except Exception:
+            logger.warning(
+                "failed to extend dedup reservation for event_id=%s "
+                "project_id=%s after successful XADD — dedup window for "
+                "this event will be shorter than the normal %sh",
+                event_id,
+                project_id,
+                DEDUP_TTL_SECONDS // 3600,
+            )
+        return {"id": event_id, "status": "accepted"}
+
+    async def bulk_insert_events(self, rows: list[dict]) -> int:
+        """
+        Bulk-insert a batch of already-validated event rows into
+        cost_events within the caller's transaction.
+
+        Used exclusively by the ingestion worker (see workers/cost_event_worker.py).
+        Caller is responsible for commit/rollback — this method only executes
+        the INSERT and returns the row count, so the worker can XACK the
+        batch atomically with the commit (commit succeeds -> XACK; commit
+        raises -> leave unacked for redelivery).
+
+        Single multi-VALUES INSERT for the whole batch in one round trip,
+        rather than one INSERT per row, since this runs once per batch
+        (default 100s of rows) rather than once per event.
+        """
+        if not rows:
+            return 0
+
         await self.session.execute(
             text("""
                 INSERT INTO cost_events (
@@ -62,17 +242,13 @@ class CostService:
                     :input_image_tokens, :cached_input_image_tokens,
                     :output_image_tokens,
                     :image_count,
-                    :cost_usd, NOW()
+                    :cost_usd, :created_at
                 )
+                ON CONFLICT (id) DO NOTHING
             """),
-            {
-                "id": event_id,
-                "project_id": project_id,
-                "cost_usd": cost_usd,
-                **event.model_dump(),
-            },
+            rows,
         )
-        return {"id": event_id, "status": "accepted"}
+        return len(rows)
 
     async def get_by_tenant(
         self,

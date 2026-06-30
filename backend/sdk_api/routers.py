@@ -54,17 +54,23 @@ async def _fetch_db_rates(
     provider: str,
     model_id: str,
     user_id: int | None,
+    cache: dict[tuple[str, str, int | None], dict | None],
 ) -> dict | None:
     """
     Fetch the latest pricing for (provider, model_id).
 
+    Uses a per-request cache to avoid repeated database queries for the same
+    (provider, model_id, user_id) combination.
+
     Priority:
       1. SYSTEM pricing (author_id IS NULL)
       2. Current user's custom pricing (author_id = :user_id)
-
-    Other users' pricing is never considered.
     """
-    print("getting rates form db, user id:", user_id)
+    key = (provider, model_id, user_id)
+
+    if key in cache:
+        return cache[key]
+
     result = await db.execute(
         text("""
             SELECT
@@ -108,7 +114,10 @@ async def _fetch_db_rates(
     )
 
     row = result.mappings().first()
-    return dict(row) if row else None
+    pricing = dict(row) if row else None
+
+    cache[key] = pricing
+    return pricing
 
 
 # ───────────────────────────────────────────────────────────────
@@ -117,6 +126,14 @@ async def _fetch_db_rates(
 # NOTE: This endpoint is intended for SDK use only (via API key), not the
 # dashboard UI. It is kept here for completeness but the dashboard never
 # calls it.
+#
+# As of the Redis Streams refactor, this endpoint validates the request,
+# calculates cost, updates the Redis tenant cost cache, and XADDs the
+# event to the durable write queue. It does NOT write to PostgreSQL —
+# that's the worker's job (workers/cost_event_worker.py), which reads
+# the stream via a consumer group and bulk-inserts in batches.
+
+
 async def check_plan_limits(request: Request):
     project = request.state.project
     if project["is_blocked"] == True:
@@ -142,17 +159,26 @@ async def ingest_cost_event(
     db: AsyncSession = Depends(get_db),
     redis_client=Depends(get_redis),
 ):
-    """Receive a batch of SDK cost events, calculate their cost, and persist them."""
+    """
+    Receive a batch of SDK cost events, calculate their cost, update the
+    live Redis tenant cache, and enqueue each event onto the durable
+    Redis Stream write queue (see backend.dashboard.streams) before
+    returning 202. This endpoint no longer writes to PostgreSQL directly
+    — a separate worker process consumes the stream and performs the
+    durable insert. See workers/cost_event_worker.py.
+    """
     project_id = request.state.project_id
     cost_svc = CostService(db)
     counter = 0
-
+    rate_cache = {}
     for ev in events.events:
         from ..sdk_api.pricing import infer_provider
-        print("event:::",ev.total_tokens)
+
         provider = infer_provider(ev.model) or ev.provider or "unknown"
         tenant_id = ev.tenant_id
-        db_rates = await _fetch_db_rates(db, provider, ev.model,request.state.user_id)
+        db_rates = await _fetch_db_rates(
+            db, provider, ev.model, request.state.user_id, cache=rate_cache
+        )
         breakdown = calculate_cost(
             model=ev.model,
             input_tokens=ev.input_tokens,
@@ -174,14 +200,24 @@ async def ingest_cost_event(
             db_rates=db_rates,
         )
         cost_usd = breakdown.total_cost
-        await cost_svc.write_event(project_id, ev, cost_usd)
+        result = await cost_svc.enqueue_event(redis_client, project_id, ev, cost_usd)
 
         # Keep any already-warm cost cache entries for this tenant/project in
-        # sync, rather than invalidating them. The event is saved to the DB
-        # regardless of cache state; this only updates the cache so
-        # check-tenant-limit doesn't have to wait out the TTL or hit the DB
-        # to see this event. Never creates a cache key (see apply_cost_to_cache).
-        await apply_cost_to_cache(redis_client, tenant_id, project_id, cost_usd)
+        # sync, rather than invalidating them. This only updates the
+        # cache so check-tenant-limit doesn't have to wait out the TTL or
+        # hit the DB to see this event. Never creates a cache key (see
+        # apply_cost_to_cache). Since Redis is updated synchronously here
+        # (ahead of the worker's eventual Postgres insert), live budget
+        # enforcement via check-tenant-limit stays correct even if the
+        # worker falls behind — Redis is the source of truth for limits,
+        # Postgres is the historical ledger.
+        #
+        # Skipped entirely for duplicate_ignored events (see enqueue_event):
+        # the original attempt already incremented this cache, so a retry
+        # must not increment it again, or the tenant's live spend would be
+        # double-counted even though only one Postgres row ever lands.
+        if result["status"] != "duplicate_ignored":
+            await apply_cost_to_cache(redis_client, tenant_id, project_id, cost_usd)
 
         counter += 1
 
