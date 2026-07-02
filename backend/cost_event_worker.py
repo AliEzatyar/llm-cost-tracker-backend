@@ -35,8 +35,9 @@ import time
 from contextlib import suppress
 
 import redis.asyncio as redis
+from sqlalchemy.exc import DataError, IntegrityError
 
-from backend.database.database import async_session_factory
+from backend.database.database import AsyncSessionLocal
 from backend.dashboard.services import CostService
 from backend.dashboard.streams import (
     COST_EVENTS_GROUP,
@@ -44,6 +45,14 @@ from backend.dashboard.streams import (
     ensure_consumer_group,
 )
 from backend.sdk_api.schemas import CostEventIn
+
+# Postgres errors that mean "this row can never succeed, no matter how many
+# times it's retried" — malformed UUIDs, bad enum values, NOT NULL/FK/unique
+# violations, out-of-range numerics, etc. These are permanent and must be
+# dropped (dead-lettered via logging) rather than retried forever. Anything
+# else (connection drops, timeouts, deadlocks/serialization failures) is
+# treated as transient and keeps the existing retry-forever behavior.
+PERMANENT_DB_ERRORS = (IntegrityError, DataError)
 
 logger = logging.getLogger("cost_event_worker")
 logging.basicConfig(
@@ -156,32 +165,52 @@ async def _claim_stale_pending(redis_client: redis.Redis) -> None:
         )
 
 
+async def _insert_one(row: dict) -> None:
+    """Insert+commit a single row in its own session/transaction. Used as
+    the row-by-row fallback when a batch insert fails with a permanent DB
+    error, so we can isolate exactly which row(s) are poisoned."""
+    async with AsyncSessionLocal() as session:
+        cost_svc = CostService(session)
+        await cost_svc.bulk_insert_events([row])
+        await session.commit()
+
+
 async def _process_batch(
     redis_client: redis.Redis, messages: list[tuple[str, dict]]
 ) -> None:
     """
     Parse, bulk-insert, commit once, then XACK the whole batch.
 
-    On any DB failure, the exception propagates without acking. The
-    messages stay in the consumer group's Pending Entries List (PEL)
-    under this consumer's name. As long as this consumer process stays
-    alive, the next XREADGROUP call simply reads further new ('>')
-    entries — the unacked ones remain correctly attributed to this
-    consumer and visible via XPENDING for monitoring. If this consumer
-    dies before acking, _claim_stale_pending reassigns them to whichever
-    consumer starts next, once they've been idle past CLAIM_IDLE_MS.
+    On a *transient* DB failure (connection drop, timeout, deadlock/
+    serialization failure), the exception propagates without acking.
+    Those messages stay in the consumer group's Pending Entries List
+    (PEL) under this consumer's name and are retried on the next loop
+    iteration, exactly as before.
+
+    On a *permanent* DB failure (IntegrityError/DataError — malformed
+    UUID, bad enum, constraint violation, etc.), the batch can never
+    succeed as a whole no matter how many times it's retried. Rather
+    than wedge every message behind it forever, we fall back to
+    inserting rows one at a time: rows that succeed individually are
+    acked and committed; rows that fail with the same permanent error
+    are logged and dropped (acked without being inserted, i.e. dead-
+    lettered via logs); rows that fail with something transient are
+    left unacked so they're retried normally. If this consumer dies
+    before acking, _claim_stale_pending reassigns any still-pending
+    entries to whichever consumer starts next, once they've been idle
+    past CLAIM_IDLE_MS.
     """
     t_parse_start = time.monotonic()
-    rows = []
+    parsed: list[tuple[str, dict]] = []  # (message_id, row)
     message_ids = []
     for message_id, fields in messages:
         message_ids.append(message_id)
         row = _row_from_stream_fields(message_id, fields)
         if row is not None:
-            rows.append(row)
+            parsed.append((message_id, row))
     parse_ms = (time.monotonic() - t_parse_start) * 1000
 
-    if not rows:
+    if not parsed:
         # Every message in the batch was a poison/unparseable payload —
         # ack them anyway so the queue doesn't stall on permanently
         # invalid data.
@@ -189,17 +218,83 @@ async def _process_batch(
             await redis_client.xack(COST_EVENTS_STREAM, COST_EVENTS_GROUP, *message_ids)
         return
 
+    rows = [row for _, row in parsed]
+
     t_insert_start = time.monotonic()
     try:
-        async with async_session_factory() as session:
+        async with AsyncSessionLocal() as session:
             cost_svc = CostService(session)
             inserted = await cost_svc.bulk_insert_events(rows)
             await session.commit()
+    except PERMANENT_DB_ERRORS:
+        # The batch as a whole is poisoned by at least one bad row.
+        # Isolate the culprit(s) with a row-by-row fallback instead of
+        # leaving the entire batch (including good rows) unacked forever.
+        logger.warning(
+            "batch insert hit a permanent DB error, falling back to "
+            "row-by-row insert to isolate poison rows batch_size=%d",
+            len(rows),
+        )
+        inserted = 0
+        # Messages that never parsed into a row at all were already
+        # permanently dropped above (poison JSON/schema) — ack them here
+        # too, since they were never part of `parsed` and would otherwise
+        # never get acked.
+        parsed_ids = {mid for mid, _ in parsed}
+        ack_ids: list[str] = [mid for mid in message_ids if mid not in parsed_ids]
+        transient_failures = 0
+        for message_id, row in parsed:
+            try:
+                await _insert_one(row)
+                ack_ids.append(message_id)
+                inserted += 1
+            except PERMANENT_DB_ERRORS as row_exc:
+                logger.error(
+                    "dropping poison row: permanent DB error, will never "
+                    "succeed on retry message_id=%s event_id=%s error=%s",
+                    message_id,
+                    row.get("id", "?"),
+                    row_exc,
+                )
+                ack_ids.append(message_id)  # ack = drop, do not retry
+            except Exception as row_exc:
+                logger.error(
+                    "row insert failed with transient error, leaving "
+                    "unacked for retry message_id=%s event_id=%s error=%s",
+                    message_id,
+                    row.get("id", "?"),
+                    row_exc,
+                    exc_info=True,
+                )
+                transient_failures += 1
+                # deliberately not added to ack_ids -> stays in PEL
+
+        if ack_ids:
+            await redis_client.xack(COST_EVENTS_STREAM, COST_EVENTS_GROUP, *ack_ids)
+
+        insert_ms = (time.monotonic() - t_insert_start) * 1000
+        logger.info(
+            "row-by-row fallback complete batch_size=%d inserted=%d "
+            "dropped=%d transient=%d insert_latency_ms=%.1f",
+            len(rows),
+            inserted,
+            len(ack_ids) - inserted,
+            transient_failures,
+            insert_ms,
+        )
+
+        if transient_failures:
+            # At least one row failed for a non-permanent reason and is
+            # still unacked. Raise so the outer loop marks it for retry
+            # (the successful/dropped rows are already acked above, so
+            # only the genuinely-retryable ones will be re-read next time).
+            raise
+        return
     except Exception:
         insert_ms = (time.monotonic() - t_insert_start) * 1000
         logger.error(
-            "batch insert failed, leaving %d messages unacked for retry "
-            "batch_size=%d insert_latency_ms=%.1f",
+            "batch insert failed with a transient error, leaving %d "
+            "messages unacked for retry batch_size=%d insert_latency_ms=%.1f",
             len(message_ids),
             len(messages),
             insert_ms,
@@ -223,7 +318,9 @@ async def _process_batch(
 
 
 async def run_worker(stop_event: asyncio.Event) -> None:
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client = redis.from_url(
+        REDIS_URL, decode_responses=True, socket_timeout=10, socket_connect_timeout=2
+    )
 
     # Startup can race with Redis still coming up despite the Compose
     # healthcheck dependency (e.g. healthy-but-not-yet-accepting-writes
@@ -320,7 +417,7 @@ async def run_worker(stop_event: asyncio.Event) -> None:
                     consumername=CONSUMER_NAME,
                     streams={COST_EVENTS_STREAM: ">"},
                     count=BATCH_SIZE,
-                    block=BLOCK_MS,
+                    block=10,
                 )
 
                 if not response:

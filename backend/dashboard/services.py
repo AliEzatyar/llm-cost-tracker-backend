@@ -126,8 +126,16 @@ class CostService:
         didn't supply one, for backward compatibility with older SDK
         versions that predate event_id-based idempotency.
         """
-        event_id = getattr(event, "event_id", None) or str(uuid.uuid4())
-
+        event_id = getattr(event, "event_id", None)
+        if not event_id:
+            logger.warning(
+                "enqueue_event called without event_id (SDK version predates idempotency) — "
+                "minting server-side UUID %s for project_id=%s",
+                event_id,
+                project_id,
+            )
+            return {"id": event_id, "status": "rejected_no_event_id"}
+            
         dedup_key = f"ingest:dedup:{project_id}:{event_id}"
         # NX = only set if absent; this is the atomic "have we seen this
         # event_id before" check. Reserve at a SHORT ttl first — just

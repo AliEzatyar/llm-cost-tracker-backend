@@ -2,6 +2,7 @@
 Thin wrapper around the Stripe SDK.
 All raw Stripe calls live here — services never import stripe directly.
 """
+
 from dotenv import load_dotenv
 import os
 import stripe
@@ -14,7 +15,7 @@ WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
 # ---------------------------------------------------------------------------
 # Customer
 # ---------------------------------------------------------------------------
-    
+
 
 def create_customer(email: str, project_id: str, name: str) -> stripe.Customer:
     return stripe.Customer.create(
@@ -50,7 +51,7 @@ def create_checkout_session(
         metadata={"project_id": project_id},
         allow_promotion_codes=True,
         billing_address_collection="auto",
-        expand=["line_items"],  
+        expand=["line_items"],
     )
 
 
@@ -81,12 +82,25 @@ def change_subscription_plan(
     subscription_id: str,
     new_price_id: str,
 ) -> stripe.Subscription:
-    """Upgrade or downgrade — prorated immediately."""
+    """
+    Upgrade or downgrade — resets the billing cycle to start now.
+
+    billing_cycle_anchor="now" resets current_period_start/current_period_end
+    so the new cycle runs from today for one full interval (Stripe handles
+    28/29/30/31-day months correctly), and the next renewal lands exactly one
+    month from today rather than staying anchored to the original signup date.
+
+    proration_behavior="none" means no credit/charge is calculated against the
+    old plan's remaining time — Stripe bills the full price of the new plan
+    immediately on the customer's card, and nothing from the previous plan's
+    cycle carries over or gets separately invoiced.
+    """
     sub = stripe.Subscription.retrieve(subscription_id)
     return stripe.Subscription.modify(
         subscription_id,
         items=[{"id": sub["items"]["data"][0]["id"], "price": new_price_id}],
-        proration_behavior="always_invoice",
+        proration_behavior="none",
+        billing_cycle_anchor="now",
     )
 
 

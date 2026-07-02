@@ -295,6 +295,44 @@ async def sync_tracked_spend(
     return total_usd
 
 
+async def _reset_usage_snapshot_for_period(
+    session: AsyncSession,
+    subscription_id,
+    period_start: datetime,
+    period_end: datetime,
+) -> MonthlyUsageSnapshot:
+    """
+    Ensure a MonthlyUsageSnapshot row exists for this exact billing period,
+    with tracked spend reset to 0 and no block/grace flags carried over from
+    a previous plan or cycle.
+
+    Called whenever a subscription's billing period restarts "now" (plan
+    upgrade/downgrade — see stripe_client.change_subscription_plan). Without
+    this, is_project_blocked()/the /subscription route would keep reading the
+    *old* snapshot (matched by old period_start) until the next ingest-driven
+    sync_tracked_spend() call happened to notice the period changed and
+    created a fresh one — leaving stale spend/block state visible in the
+    meantime.
+    """
+    snapshot = await get_current_usage_snapshot(session, subscription_id, period_start)
+    if snapshot is None:
+        snapshot = MonthlyUsageSnapshot(
+            subscription_id=subscription_id,
+            period_start=period_start,
+            period_end=period_end,
+            tracked_spend_usd=0.0,
+        )
+        session.add(snapshot)
+    else:
+        snapshot.tracked_spend_usd = 0.0
+        snapshot.period_end = period_end
+        snapshot.updated_at = datetime.now(timezone.utc)
+
+    snapshot.limit_exceeded = False
+    snapshot.grace_period_started_at = None
+    return snapshot
+
+
 async def is_project_blocked(session: AsyncSession, project_id: str) -> bool:
     """
     Fast check called on every ingest request.
@@ -361,17 +399,32 @@ async def change_plan(
         sub.stripe_subscription_id, plan.stripe_price_id_monthly
     )
 
+    # Stripe's Basil API version (2025-03-31+) removed current_period_start/
+    # current_period_end from the top-level Subscription object — they now
+    # live on the subscription item instead. Mirror the fallback already
+    # used in _on_subscription_updated() below, or this KeyErrors on any
+    # account running Basil or later and the whole upgrade silently fails
+    # to persist (Stripe's side still goes through — only our DB write
+    # never happens).
+    item = stripe_sub["items"]["data"][0]
+    raw_start = stripe_sub.get("current_period_start") or item.get(
+        "current_period_start"
+    )
+    raw_end = stripe_sub.get("current_period_end") or item.get("current_period_end")
+    if raw_start is None or raw_end is None:
+        raise RuntimeError(
+            f"Stripe subscription {stripe_sub['id']} returned no "
+            "current_period_start/end on either the subscription or its "
+            "item — check the account's Stripe API version."
+        )
+
     # Use the Stripe response to update all fields immediately so the DB is
     # fully in sync without waiting for the webhook to arrive.
     sub.plan = new_plan_key
-    sub.stripe_price_id = stripe_sub["items"]["data"][0]["price"]["id"]
+    sub.stripe_price_id = item["price"]["id"]
     sub.cancel_at_period_end = stripe_sub["cancel_at_period_end"]
-    sub.current_period_start = datetime.fromtimestamp(
-        stripe_sub["current_period_start"], tz=timezone.utc
-    )
-    sub.current_period_end = datetime.fromtimestamp(
-        stripe_sub["current_period_end"], tz=timezone.utc
-    )
+    sub.current_period_start = datetime.fromtimestamp(raw_start, tz=timezone.utc)
+    sub.current_period_end = datetime.fromtimestamp(raw_end, tz=timezone.utc)
     sub.status = stripe_sub["status"]
 
     await session.execute(
@@ -379,17 +432,31 @@ async def change_plan(
         {"plan": new_plan_key, "id": project_id},
     )
 
-    # Clear snapshot block flags immediately on plan change.
-    snapshot_result = await session.execute(
-        select(MonthlyUsageSnapshot)
-        .where(MonthlyUsageSnapshot.subscription_id == sub.id)
-        .order_by(MonthlyUsageSnapshot.period_start.desc())
-        .limit(1)
+    # The Stripe call above reset the billing cycle to start now (see
+    # stripe_client.change_subscription_plan), so sub.current_period_start/end
+    # were just set to the new cycle a few lines up. Reset usage tracking to
+    # that new period rather than clearing flags on whatever snapshot happens
+    # to be "latest" — that snapshot still belongs to the old period and
+    # carries the old plan's tracked spend.
+    await _reset_usage_snapshot_for_period(
+        session, sub.id, sub.current_period_start, sub.current_period_end
     )
-    snapshot = snapshot_result.scalar_one_or_none()
-    if snapshot is not None:
-        snapshot.limit_exceeded = False
-        snapshot.grace_period_started_at = None
+
+    # Clear any block/grace-period flags carried over from the old plan.
+    # check_plan_limits() (routers.py, run on every /ingest call) reads
+    # projects.is_blocked directly — it does NOT consult the snapshot's
+    # limit_exceeded flag above — so without this, a project that was
+    # blocked on the old plan stays blocked after upgrading, even though
+    # usage was just reset to 0 for the new period.
+    await session.execute(
+        text("""
+            UPDATE projects
+            SET    is_blocked               = FALSE,
+                   grace_period_started_at  = NULL
+            WHERE  id = :id
+        """),
+        {"id": project_id},
+    )
 
     await session.commit()
     return sub
@@ -646,22 +713,30 @@ async def _on_subscription_updated(session: AsyncSession, payload: dict) -> None
 
         print(f"Updated project {sub.project_id} to plan {plan_key}")
 
-        snapshot_result = await session.execute(
-            select(MonthlyUsageSnapshot)
-            .where(MonthlyUsageSnapshot.subscription_id == sub.id)
-            .order_by(MonthlyUsageSnapshot.period_start.desc())
-            .limit(1)
-        )
-
-        snapshot = snapshot_result.scalar_one_or_none()
-
-        if snapshot is not None:
-            print(f"Clearing limits on snapshot {snapshot.id}")
-
-            snapshot.limit_exceeded = False
-            snapshot.grace_period_started_at = None
+        # period_start/period_end above are the freshly-reset cycle for this
+        # plan change. Reset usage tracking to it (idempotent against the
+        # same reset change_plan() already did synchronously — this branch is
+        # what actually applies it if the plan was changed directly in the
+        # Stripe dashboard rather than through our API).
+        if period_start and period_end:
+            await _reset_usage_snapshot_for_period(
+                session, sub.id, period_start, period_end
+            )
+            # Same reasoning as change_plan(): check_plan_limits() reads
+            # projects.is_blocked directly, not the snapshot, so it has to
+            # be cleared here too or a project blocked on the old plan
+            # stays blocked after a dashboard-initiated plan change.
+            await session.execute(
+                text("""
+                    UPDATE projects
+                    SET    is_blocked               = FALSE,
+                           grace_period_started_at  = NULL
+                    WHERE  id = :id
+                """),
+                {"id": sub.project_id},
+            )
         else:
-            print("No usage snapshot found")
+            print("No period_start/period_end on event — skipping usage reset")
     else:
         print("No plan change detected")
 

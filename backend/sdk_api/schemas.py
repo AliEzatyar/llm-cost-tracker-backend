@@ -4,8 +4,9 @@
 
 
 from pydantic import BaseModel
-from typing import Any
+from typing import Any, Optional
 from pydantic import BaseModel, Field
+
 
 class CostEventIn(BaseModel):
     """
@@ -37,6 +38,18 @@ class CostEventIn(BaseModel):
         + output_image_tokens
         + image_count  (audit only, not used for billing)
     """
+
+    # ── identity ──────────────────────────────────────────────────────────────
+    # Client-generated idempotency key (SDK's LLMEvent.event_id, created once
+    # at capture time — see token_limit.types.LLMEvent). Without this field
+    # declared here, Pydantic silently drops event_id from the incoming
+    # payload, and backend.dashboard.services.CostService.enqueue_event falls
+    # back to minting a fresh UUID on every call — which defeats both the
+    # Redis SETNX dedup guard and the Postgres ON CONFLICT (id) DO NOTHING,
+    # letting client retries (or any duplicate submission) create real
+    # duplicate rows. Optional only for backward compatibility with SDK
+    # versions that predate event_id-based idempotency.
+    event_id: Optional[uuid] = None
 
     # ── call metadata ─────────────────────────────────────────────────────────
     provider: str
@@ -79,4 +92,3 @@ class ThresholdIn(BaseModel):
     tenant_id: str
     limit_usd: float = Field(gt=0)
     project_id: str
-

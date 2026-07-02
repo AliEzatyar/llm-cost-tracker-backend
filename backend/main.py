@@ -122,7 +122,11 @@ async def auth_middleware(request: Request, call_next):
     # --------------------------------------------------
     api_key = request.headers.get("X-API-Key")
     if api_key:
-        api_key = api_key.split("Bearer ")[1]
+        try:
+            api_key = api_key.split("Bearer ")[1]
+        except:
+            return JSONResponse(status_code=400,
+                                content={"detail":"invalid api key headers"})
         async with AsyncSessionLocal() as session:
             project = await get_project_by_api_key(session, api_key)
         if not project:

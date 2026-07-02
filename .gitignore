@@ -38,3 +38,8 @@ htmlcov/
 **backend/__pycache__/**
 docker-compose.yml
 nginx.conf
+scrpaing.py
+issues.log
+yc_com**
+# testing
+test_cost_event_worker_pipeline.py

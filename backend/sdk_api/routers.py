@@ -28,10 +28,7 @@ from backend.sdk_api.schemas import (
 from backend.configs import get_redis, limiter
 from backend.database.models import (
     CostEvent,
-    ModelPricing,
     Threshold,
-    User,
-    get_project_by_api_key,
 )
 from backend.sdk_api.cost_calculator import calculate_cost
 from sqlalchemy import text
@@ -173,7 +170,7 @@ async def ingest_cost_event(
     rate_cache = {}
     for ev in events.events:
         from ..sdk_api.pricing import infer_provider
-
+        print(ev.event_id, ev.model, ev.provider, ev.tenant_id,"eve::::")
         provider = infer_provider(ev.model) or ev.provider or "unknown"
         tenant_id = ev.tenant_id
         db_rates = await _fetch_db_rates(
