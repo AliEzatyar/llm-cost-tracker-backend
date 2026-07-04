@@ -472,7 +472,8 @@ async def _get_thresholds(
     # --------------------------------------------------------------------------------
     user_daily_threshold_result = await db.execute(
         select(Threshold).where(
-            Threshold.tenant_id == tenant_id, Threshold.frequency == Threshold.PER_DAY
+            Threshold.tenant_id == tenant_id, Threshold.frequency == Threshold.PER_DAY,
+            Threshold.project_id == project_id,
         )
     )
     daily_threshold = user_daily_threshold_result.scalar_one_or_none()
@@ -482,7 +483,8 @@ async def _get_thresholds(
     # monthly
     user_monthly_threshold_result = await db.execute(
         select(Threshold).where(
-            Threshold.tenant_id == tenant_id, Threshold.frequency == Threshold.PER_MONTH
+            Threshold.tenant_id == tenant_id, Threshold.frequency == Threshold.PER_MONTH,
+            Threshold.project_id == project_id,
         )
     )
     monthly_threshold = user_monthly_threshold_result.scalar_one_or_none()

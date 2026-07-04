@@ -61,7 +61,7 @@ logging.basicConfig(
 )
 
 # ── configuration (env-overridable; sane defaults for moderate traffic) ──
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/10")
 CONSUMER_NAME = os.getenv("WORKER_CONSUMER_NAME") or os.uname().nodename
 BATCH_SIZE = int(os.getenv("WORKER_BATCH_SIZE", "100"))
 BLOCK_MS = int(os.getenv("WORKER_BLOCK_MS", "5000"))  # XREADGROUP block timeout

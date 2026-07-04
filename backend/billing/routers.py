@@ -95,14 +95,13 @@ async def get_subscription(request: Request, db: AsyncSession = Depends(get_db))
         )
 
     plan = get_plan(sub.plan)
-    result = await db.execute(
-        select(MonthlyUsageSnapshot)
-        .where(MonthlyUsageSnapshot.subscription_id == sub.id)
-        .order_by(MonthlyUsageSnapshot.period_start.desc())
-        .limit(1)
+    snapshot = await db.execute(
+        select(MonthlyUsageSnapshot).where(
+            MonthlyUsageSnapshot.subscription_id == sub.id,
+            MonthlyUsageSnapshot.period_start == sub.current_period_start,
+        )
     )
-    snapshot = result.scalar_one_or_none()
-
+    snapshot = snapshot.scalar_one_or_none()
     now = datetime.now(timezone.utc)
     grace_elapsed = 0
     # FIX: derive both limit_reached and is_blocked from same snapshot read
@@ -118,7 +117,6 @@ async def get_subscription(request: Request, db: AsyncSession = Depends(get_db))
                 is_blocked = True
         if snapshot.limit_exceeded:
             is_blocked = True
-
     return SubscriptionResponse(
         plan=sub.plan,
         status=sub.status,
@@ -166,15 +164,25 @@ async def create_checkout(
         if not project:
             raise HTTPException(status_code=400, detail="No project selected.")
     user_email = current_user.email
-    url = await services.create_upgrade_checkout(
-        session=db,
-        project=project,
-        user_email=user_email,
-        plan_key=body.plan,
-        success_url=body.success_url,
-        cancel_url=body.cancel_url,
+    try:
+        result = await services.create_upgrade_checkout(
+            session=db,
+            project=project,
+            user_email=user_email,
+            plan_key=body.plan,
+            success_url=body.success_url,
+            cancel_url=body.cancel_url,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # result["checkout_url"] is set for free -> paid (redirect to Stripe).
+    # result["plan_changed"] is True for paid -> paid (already applied in
+    # place via change_plan() — nothing to redirect to, just refresh state).
+    return CheckoutResponse(
+        checkout_url=result["checkout_url"],
+        plan_changed=result["plan_changed"],
     )
-    return CheckoutResponse(checkout_url=url)
 
 
 @router.post("/portal", response_model=PortalResponse)
@@ -258,7 +266,7 @@ async def stripe_webhook(
     stripe_signature: str = Header(None, alias="stripe-signature"),
 ):
     payload = await request.body()
-    
+
     try:
         event = construct_webhook_event(payload, stripe_signature)
     except Exception as e:

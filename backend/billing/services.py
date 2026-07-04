@@ -89,14 +89,39 @@ async def create_upgrade_checkout(
     plan_key: str,
     success_url: str,
     cancel_url: str,
-) -> str:
-    """Returns a Stripe Checkout URL for the given plan."""
+) -> dict:
+    """
+    Get the customer onto `plan_key`, without ever creating a second live
+    Stripe subscription for the same project.
+
+    Returns a dict with:
+      - checkout_url: str | None — set when the project is new to paid plans
+        and needs to complete Stripe Checkout to attach a payment method.
+      - plan_changed: bool — True when the project already had an active
+        subscription and was switched in place via change_plan() instead
+        (no redirect needed — the plan change already happened).
+
+    Free -> paid always goes through checkout_url (Stripe needs a payment
+    method). Paid -> paid goes through change_plan(), because Stripe
+    Checkout in subscription mode always creates a brand-new Subscription
+    object rather than modifying an existing one — routing an existing
+    subscriber through checkout would leave two live subscriptions billing
+    the customer in parallel.
+    """
     plan: Plan = get_plan(plan_key)
 
     if plan.stripe_price_id_monthly is None:
         raise ValueError(f"Plan '{plan_key}' has no Stripe price ID configured.")
 
     sub = await get_or_create_subscription(session, project, user_email)
+
+    if sub.stripe_subscription_id and sub.status in ("active", "trialing", "past_due"):
+        # Already subscribed — this is a plan switch, not a new subscription.
+        # Modify the existing Stripe subscription in place.
+        if sub.plan == plan_key:
+            raise ValueError(f"Project is already on plan '{plan_key}'.")
+        await change_plan(session, project.id, plan_key)
+        return {"checkout_url": None, "plan_changed": True}
 
     session_obj = create_checkout_session(
         customer_id=sub.stripe_customer_id,
@@ -106,7 +131,7 @@ async def create_upgrade_checkout(
         project_id=project.id,
     )
     await session.commit()
-    return session_obj["url"]
+    return {"checkout_url": session_obj["url"], "plan_changed": False}
 
 
 async def create_portal_url(
@@ -135,6 +160,7 @@ async def get_current_usage_snapshot(
     subscription_id,
     period_start: datetime,
 ) -> Optional[MonthlyUsageSnapshot]:
+
     result = await session.execute(
         select(MonthlyUsageSnapshot).where(
             MonthlyUsageSnapshot.subscription_id == subscription_id,
@@ -164,8 +190,8 @@ async def sync_tracked_spend(
             SELECT COALESCE(SUM(total_cost_usd), 0)
             FROM   customer_cost_daily
             WHERE  project_id = :project_id
-              AND  date >= :start
-              AND  date <  :end
+              AND  date > :start
+              AND  date <=  :end
         """),
         {
             "project_id": project_id,
@@ -278,11 +304,12 @@ async def sync_tracked_spend(
 
         grace_elapsed = (now - snapshot.grace_period_started_at).days
         if grace_elapsed >= plan.grace_period_days:
+
             snapshot.limit_exceeded = True
             project = await get_project_by_id(session, project_id)
             project.is_blocked = True
             print(
-                "project=%s hard-blocked after %d-day grace period",
+                "project= hard-blocked after day grace period",
                 project_id,
                 plan.grace_period_days,
             )
@@ -407,10 +434,12 @@ async def change_plan(
     # to persist (Stripe's side still goes through — only our DB write
     # never happens).
     item = stripe_sub["items"]["data"][0]
-    raw_start = stripe_sub.get("current_period_start") or item.get(
-        "current_period_start"
+    raw_start = getattr(stripe_sub, "current_period_start", None) or getattr(
+        item, "current_period_start", None
     )
-    raw_end = stripe_sub.get("current_period_end") or item.get("current_period_end")
+    raw_end = getattr(stripe_sub, "current_period_end", None) or getattr(
+        item, "current_period_end", None
+    )
     if raw_start is None or raw_end is None:
         raise RuntimeError(
             f"Stripe subscription {stripe_sub['id']} returned no "
@@ -575,6 +604,32 @@ async def _on_checkout_completed(session: AsyncSession, payload: dict) -> None:
     )
     sub = result.scalar_one_or_none()
     if sub:
+        old_subscription_id = sub.stripe_subscription_id
+
+        # Safety net: create_upgrade_checkout() should already block this,
+        # but if a duplicate Checkout Session ever completes for a project
+        # that already had a live subscription (race condition, retried
+        # request, manual link reuse, etc.), don't silently orphan the old
+        # subscription in Stripe — cancel it immediately so the customer
+        # isn't billed on two subscriptions at once.
+        if old_subscription_id and old_subscription_id != stripe_subscription_id:
+            try:
+                cancel_subscription(old_subscription_id, at_period_end=False)
+                logger.warning(
+                    "Canceled orphaned duplicate subscription %s for project %s "
+                    "(replaced by %s)",
+                    old_subscription_id,
+                    project_id,
+                    stripe_subscription_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to cancel orphaned subscription %s for project %s — "
+                    "manual cleanup required in Stripe dashboard",
+                    old_subscription_id,
+                    project_id,
+                )
+
         sub.stripe_subscription_id = stripe_subscription_id
         sub.stripe_customer_id = stripe_customer_id
         sub.status = "active"

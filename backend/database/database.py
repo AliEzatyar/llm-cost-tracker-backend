@@ -67,7 +67,6 @@ async def create_all_tables() -> None:
     Call once at application startup (or use Alembic for migrations).
     """
     async with engine.begin() as conn:
-        print(Base.metadata,"base...")
         await conn.run_sync(Base.metadata.create_all)
 
 

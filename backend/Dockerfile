@@ -4,7 +4,7 @@ FROM python:3.11-slim
 # Step 2: Set environment variables for Python and Poetry paths
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    POETRY_VERSION=1.8.3 \
+    POETRY_VERSION=2.4.1 \
     POETRY_HOME="/opt/poetry" \
     POETRY_VIRTUALENVS_CREATE=false
 
@@ -38,4 +38,4 @@ RUN poetry install --no-interaction --no-ansi --only main
 EXPOSE 8000
 
 # Step 11: Run the application using Uvicorn
-CMD ["poetry", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+CMD ["poetry", "run", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]

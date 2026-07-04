@@ -155,15 +155,16 @@ async def sync_all_projects(session_factory: async_sessionmaker) -> None:
         subscriptions = result.scalars().all()
     for sub in subscriptions:
         if not sub.current_period_start or not sub.current_period_end:
+            # logging if any subscription has no period dates yet (webhook pending?)
             logger.warning(
                 "Skipping project=%s — subscription has no period dates yet (webhook pending?)",
                 sub.project_id,
             )
             continue
         else:
+            #
             period_start = sub.current_period_start
             period_end = sub.current_period_end
-
         async with session_factory() as session:
             try:
                 total = await sync_tracked_spend(
@@ -237,7 +238,7 @@ def start_scheduler() -> None:
     # Hourly rollup
     scheduler.add_job(
         job_rollup_daily,
-        trigger=IntervalTrigger(seconds=100),
+        trigger=IntervalTrigger(seconds=300),
         id="rollup_daily",
         name="Rollup raw events to daily table",
         max_instances=1,
@@ -258,7 +259,7 @@ def start_scheduler() -> None:
     # 1-hour project usage snapshot syncing
     scheduler.add_job(
         sync_all_projects,
-        trigger=IntervalTrigger(seconds=1000),
+        trigger=IntervalTrigger(seconds=300),
         id="sync_all_projects_usage_snapshot",
         name="Sync All Project Usage Sanpshot",
         max_instances=1,  # never overlap if the previous run is still going
@@ -268,7 +269,7 @@ def start_scheduler() -> None:
     )
     scheduler.add_job(
         sync_free_projects_usage,
-        trigger=IntervalTrigger(seconds=1000),
+        trigger=IntervalTrigger(seconds=300),
         id="sync_all_free_projects_usage",
         name="Sync All Free Project Usage Sanpshot",
         max_instances=1,  # never overlap if the previous run is still going

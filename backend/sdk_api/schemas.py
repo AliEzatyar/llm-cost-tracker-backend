@@ -3,6 +3,8 @@
 # ===========================================================================
 
 
+from uuid import UUID
+
 from pydantic import BaseModel
 from typing import Any, Optional
 from pydantic import BaseModel, Field
@@ -49,7 +51,7 @@ class CostEventIn(BaseModel):
     # letting client retries (or any duplicate submission) create real
     # duplicate rows. Optional only for backward compatibility with SDK
     # versions that predate event_id-based idempotency.
-    event_id: Optional[uuid] = None
+    event_id: UUID | None = None
 
     # ── call metadata ─────────────────────────────────────────────────────────
     provider: str

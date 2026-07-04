@@ -104,8 +104,8 @@ async def enqueue_cost_event(
     event_id — this is the XADD-assigned "<ms>-<seq>" id).
     """
     fields = {
-        "event_id": event_id,
-        "project_id": project_id,
+        "event_id": str(event_id),
+        "project_id": str(project_id),
         "cost_usd": str(cost_usd),
         "data": json.dumps(event_payload, default=str),
     }
