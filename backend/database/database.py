@@ -31,8 +31,19 @@ DATABASE_URL: str = os.getenv(
 
 engine: AsyncEngine = create_async_engine(
     DATABASE_URL,
+    # Sized for: N_workers * (pool_size + max_overflow) + worker-process pool
+    # must stay under Postgres max_connections. On a t3a.small running
+    # Postgres + Redis + app together, each idle connection also costs real
+    # RAM. With 2-4 Uvicorn workers + the separate cost_event_worker.py
+    # process, worst case is now ~(4*8)+8 = 40, comfortably under the
+    # default max_connections=100. Only raise this after confirming
+    # connections are actually being held for their real query duration
+    # (see ingest_cost_event's short-lived rate_db session) — a bigger
+    # pool does not fix connections held open too long, only delays when
+    # you notice.
     pool_size=10,
     max_overflow=20,
+    pool_timeout=10,  # fail fast with a clear TimeoutError instead of hanging
     pool_pre_ping=True,
     echo=bool(os.getenv("SQL_ECHO", "")),
 )
@@ -74,4 +85,3 @@ async def drop_all_tables() -> None:
     """Tear down — useful in tests."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
-

@@ -6,20 +6,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/10")
-
-
 def create_redis_client() -> redis.Redis:
-    """
-    One client per process. redis.asyncio.Redis wraps its own internal
-    connection pool and IS safe to share across concurrent requests/coroutines
-    — unlike SQLAlchemy's AsyncSession, you don't want to create a new one
-    per request here.
-    """
     return redis.from_url(
         REDIS_URL,
-        decode_responses=True,  # so .get() returns str, not bytes — your
-        # cache helpers do float(cached) / json.loads(cached)
-        max_connections=50,
+        decode_responses=True,
+        max_connections=100,  # up from 50 — see note below
         socket_connect_timeout=2,
         socket_timeout=2,
         health_check_interval=30,

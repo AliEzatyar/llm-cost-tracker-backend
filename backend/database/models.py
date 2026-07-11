@@ -351,7 +351,8 @@ class User(Base):
         cascade="all, delete-orphan",
     )
     is_admin: Mapped[bool] = mapped_column(Boolean, nullable=True, default=False)
-
+    otp_hash = Column(String, nullable=True)
+    otp_expires_at  = Column(DateTime(timezone=True), nullable=True)
 
 # ---------------------------------------------------------------------------
 # LLM models pricing

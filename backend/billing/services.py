@@ -211,7 +211,6 @@ async def sync_tracked_spend(
         # ----------------------------------------------------------------
         free_plan = get_plan("free")
         limit = free_plan.tracked_spend_limit_usd
-        print("no sub, free, limit", limit)
         if limit is not None and total_usd > limit:
             # Read grace metadata stored on the Project row itself.
             proj_result = await session.execute(

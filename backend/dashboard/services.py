@@ -4,8 +4,7 @@
 
 
 from datetime import date, datetime, timedelta, timezone
-import hashlib
-import hmac
+import asyncio
 import uuid
 import httpx
 from sqlalchemy import text
@@ -41,6 +40,31 @@ _RESERVATION_TTL_SECONDS = 30
 # that this key set never becomes a second unbounded dataset alongside the
 # stream itself.
 DEDUP_TTL_SECONDS = 24 * 3600
+
+# Shared across ALL requests handled by this worker process — created once
+# at import time, not per-request. A semaphore created inside a method
+# (e.g. `sem = asyncio.Semaphore(20)` local to enqueue_events_batch) would
+# only cap concurrency *within one batch*; every concurrent request would
+# get its own independent semaphore, so N concurrent requests would still
+# allow N*20 concurrent XADDs — exactly the bug that caused
+# MaxConnectionsError to come back. This module-level instance is the fix:
+# every call to enqueue_events_batch across every concurrent /ingest
+# request in this process shares the same 20 slots.
+#
+# NOTE: this bounds XADD concurrency specifically. It does not bound the
+# rest of this process's Redis usage (SETNX/EXPIRE pipelines here,
+# thresholds cache checks, rate-limit checks, etc. elsewhere) — those all
+# draw from the same underlying redis-py connection pool too. If
+# MaxConnectionsError still appears outside of XADD after this fix, the
+# client-side pool's own `max_connections` (set wherever the Redis client
+# is constructed — likely backend/redis_client.py, not reviewed here) is
+# the next thing to check. The Redis *server* has maxclients=10000 with
+# room to spare, so unlike the Postgres side, there's headroom to raise
+# that pool's max_connections directly rather than only rationing demand.
+_XADD_SEMAPHORE = asyncio.Semaphore(15)  # down from 20, leaves more of the
+# worker's 100-connection pool free
+# for pipelines/cache-checks running
+# concurrently with ingest traffic
 
 
 class CostService:
@@ -206,6 +230,179 @@ class CostService:
                 DEDUP_TTL_SECONDS // 3600,
             )
         return {"id": event_id, "status": "accepted"}
+
+    async def enqueue_events_batch(
+        self,
+        redis_client,
+        project_id: str,
+        events: list[tuple[CostEventIn, float]],
+    ) -> list[dict]:
+        """
+        Batched sibling of enqueue_event. Same safety guarantees (reserve-
+        before-enqueue dedup, short-TTL-then-extend, cleanup-on-failure),
+        but applied to the whole batch instead of one event at a time, to
+        cut down Redis round trips from up to 3*N (SETNX + XADD + EXPIRE,
+        each awaited sequentially per event) to close to 3 total:
+
+          Phase 1 — pipeline every SETNX reservation in one round trip.
+          Phase 2 — fire the XADDs concurrently (asyncio.gather) rather
+                    than one at a time. This is NOT folded into the Phase 1
+                    pipeline: enqueue_cost_event's exact XADD stream
+                    name/field contract lives in streams.py, which wasn't
+                    available when this was written. Guessing at that
+                    contract risks silently mismatching what
+                    workers/cost_event_worker.py expects to consume —
+                    worse than the extra round trips. Share streams.py to
+                    fold this into Phase 1/3 as a true single pipeline.
+          Phase 3 — pipeline the EXPIRE (success) / DELETE (failure)
+                    close-out for every reserved key in one round trip.
+
+        Ordering/atomicity notes:
+          - Redis pipelines execute queued commands in order on the
+            server, one at a time — so two identical event_ids *within
+            the same batch* are still resolved correctly by Phase 1: the
+            first SETNX wins, the second sees the key already set. Same
+            protection as the original per-event SETNX for cross-request
+            races.
+          - An event with an invalid/missing event_id never reaches Phase
+            1 (same reject as enqueue_event), and now consistently does
+            NOT get a cache sync in the caller — see the routers.py fix
+            note: the previous per-event loop passed everything that
+            wasn't "duplicate_ignored" through to the cache-sync step,
+            which meant a rejected event still bumped the live Redis
+            budget cache despite never reaching the durable stream. That
+            was a real cache/ledger inconsistency, fixed by having the
+            caller branch on an explicit allow-list of "did this actually
+            get queued" statuses rather than a deny-list of one string.
+          - A failed XADD (StreamEnqueueError) no longer propagates and
+            fails the entire batch's request the way the singular
+            enqueue_event does today (it re-raises). Instead that one
+            event is marked "rejected_enqueue_failed" and its reservation
+            is deleted (same cleanup enqueue_event already does before
+            re-raising), while the rest of the batch still succeeds. This
+            is a deliberate behavior change for the batch path — flagging
+            it explicitly in case the all-or-nothing failure was load-
+            bearing somewhere downstream.
+
+        Returns one dict per input event, in the same order, each shaped
+        like enqueue_event's return value:
+            {"id": event_id, "status": "accepted" | "duplicate_ignored"
+                              | "rejected_no_event_id" | "rejected_enqueue_failed"}
+        """
+        results: list[dict | None] = [None] * len(events)
+
+        # Reject anything missing event_id up front — same as enqueue_event,
+        # these never reach Redis at all.
+        pending: list[int] = []
+        for i, (event, _cost_usd) in enumerate(events):
+            event_id = getattr(event, "event_id", None)
+            if not event_id:
+                logger.warning(
+                    "enqueue_events_batch: event without event_id (SDK version "
+                    "predates idempotency) — rejecting for project_id=%s",
+                    project_id,
+                )
+                results[i] = {"id": event_id, "status": "rejected_no_event_id"}
+            else:
+                pending.append(i)
+
+        if not pending:
+            return results  # type: ignore[return-value]
+
+        # ---- Phase 1: reserve dedup keys for the whole batch, one round trip ----
+        dedup_keys = {
+            i: f"ingest:dedup:{project_id}:{events[i][0].event_id}" for i in pending
+        }
+        reserve_pipe = redis_client.pipeline(transaction=False)
+        for i in pending:
+            reserve_pipe.set(dedup_keys[i], "1", nx=True, ex=_RESERVATION_TTL_SECONDS)
+        reserve_results = await reserve_pipe.execute()
+
+        new_indices: list[int] = []
+        for pos, i in enumerate(pending):
+            if reserve_results[pos]:
+                new_indices.append(i)
+            else:
+                logger.info(
+                    "duplicate ingest event_id=%s project_id=%s — skipping XADD "
+                    "and cache update",
+                    events[i][0].event_id,
+                    project_id,
+                )
+                results[i] = {
+                    "id": events[i][0].event_id,
+                    "status": "duplicate_ignored",
+                }
+
+        if not new_indices:
+            return results  # type: ignore[return-value]
+
+        # ---- Phase 2: XADD each newly-reserved event, with bounded concurrency ----
+        # Uses the module-level _XADD_SEMAPHORE (shared across every
+        # concurrent request in this worker process) — see its definition
+        # above for why a per-call semaphore doesn't actually bound anything.
+        async def _enqueue_one(i: int) -> tuple[int, bool]:
+            async with _XADD_SEMAPHORE:
+                event, cost_usd = events[i]
+                event_id = event.event_id
+                payload = {"id": event_id, "project_id": project_id, **event.model_dump()}
+                try:
+                    await enqueue_cost_event(
+                        redis_client,
+                        event_id=event_id,
+                        project_id=project_id,
+                        event_payload=payload,
+                        cost_usd=cost_usd,
+                    )
+                    return i, True
+                except StreamEnqueueError:
+                    logger.error(
+                        "XADD failed for event_id=%s project_id=%s — releasing "
+                        "dedup reservation so retries aren't dropped",
+                        event_id,
+                        project_id,
+                    )
+                    return i, False
+
+        outcomes = await asyncio.gather(*[_enqueue_one(i) for i in new_indices])
+
+        succeeded: list[int] = []
+        failed: list[int] = []
+        for i, ok in outcomes:
+            if ok:
+                succeeded.append(i)
+                results[i] = {"id": events[i][0].event_id, "status": "accepted"}
+            else:
+                failed.append(i)
+                results[i] = {
+                    "id": events[i][0].event_id,
+                    "status": "rejected_enqueue_failed",
+                }
+
+        # ---- Phase 3: close out dedup bookkeeping for the whole batch, one round trip ----
+        closeout_pipe = redis_client.pipeline(transaction=False)
+        for i in succeeded:
+            closeout_pipe.expire(dedup_keys[i], DEDUP_TTL_SECONDS)
+        for i in failed:
+            closeout_pipe.delete(dedup_keys[i])
+        try:
+            await closeout_pipe.execute()
+        except Exception:
+            # Best-effort, same contract as enqueue_event's single-key version:
+            # reservations self-expire within _RESERVATION_TTL_SECONDS regardless,
+            # so a failure here risks a short window of possible duplicates
+            # (caught by Postgres ON CONFLICT DO NOTHING) or a shorter-than-usual
+            # dedup window — not data loss.
+            logger.error(
+                "failed to close out dedup bookkeeping for batch project_id=%s "
+                "(%d succeeded, %d failed) — affected keys self-expire within %ss",
+                project_id,
+                len(succeeded),
+                len(failed),
+                _RESERVATION_TTL_SECONDS,
+            )
+
+        return results  # type: ignore[return-value]
 
     async def bulk_insert_events(self, rows: list[dict]) -> int:
         """

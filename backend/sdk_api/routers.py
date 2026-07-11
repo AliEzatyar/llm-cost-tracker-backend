@@ -4,15 +4,13 @@
 from datetime import datetime, time, timezone
 from sqlalchemy.orm import Session
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from backend.auth.services import get_current_user
 import redis
 from sqlalchemy.ext.asyncio import AsyncSession
-from backend import redis_client
 from backend.dashboard.services import (
     CostService,
 )
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from backend.database.database import get_db
+from backend.database.database import get_db, AsyncSessionLocal
 from backend.redis_client import _cache_get, _cache_set
 from backend.sdk_api.schemas import (
     CostEventBatch,
@@ -46,31 +44,45 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
-async def _fetch_db_rates(
+async def _fetch_db_rates_batch(
     db: AsyncSession,
-    provider: str,
-    model_id: str,
+    pairs: set[tuple[str, str]],
     user_id: int | None,
-    cache: dict[tuple[str, str, int | None], dict | None],
-) -> dict | None:
+) -> dict[tuple[str, str], dict | None]:
     """
-    Fetch the latest pricing for (provider, model_id).
+    Fetch the latest pricing for every distinct (provider, model_id) pair
+    in a single query.
 
-    Uses a per-request cache to avoid repeated database queries for the same
-    (provider, model_id, user_id) combination.
+    NOTE on scope: `user_id` (author_id) comes from `request.state.user_id`,
+    which is constant for the whole /ingest request — it is NOT a per-event
+    dimension. The old _fetch_db_rates() was being called once per event
+    with the same user_id every time, issuing up to len(events) separate
+    round-trips (minus in-request cache hits) when at most
+    len({(provider, model_id) for ev in events}) distinct rows were ever
+    needed. This fetches all of them in one query instead.
 
-    Priority:
+    Priority per pair (unchanged from the old per-event lookup):
       1. SYSTEM pricing (author_id IS NULL)
-      2. Current user's custom pricing (author_id = :user_id)
+      2. Caller's custom pricing (author_id = :user_id)
+    Tie-broken by most recent effective_from within whichever tier wins.
     """
-    key = (provider, model_id, user_id)
+    if not pairs:
+        return {}
 
-    if key in cache:
-        return cache[key]
+    pair_list = list(pairs)
+    values_clause = ", ".join(f"(:p{i}, :m{i})" for i in range(len(pair_list)))
+    params: dict[str, object] = {"author_id": user_id}
+    for i, (provider, model_id) in enumerate(pair_list):
+        params[f"p{i}"] = provider
+        params[f"m{i}"] = model_id
 
     result = await db.execute(
-        text("""
+        text(f"""
             SELECT
+                provider,
+                model_id,
+                author_id,
+                effective_from,
                 input_per_million,
                 output_per_million,
                 cache_write_per_million,
@@ -88,33 +100,33 @@ async def _fetch_db_rates(
                 per_minute_rate,
                 per_1k_chars_rate
             FROM model_pricing
-            WHERE provider = :provider
-              AND model_id = :model_id
+            WHERE (provider, model_id) IN ({values_clause})
               AND effective_from <= NOW()
               AND (
                     author_id IS NULL
                  OR author_id = :author_id
               )
-            ORDER BY
-                CASE
-                    WHEN author_id IS NULL THEN 0
-                    ELSE 1
-                END,
-                effective_from DESC
-            LIMIT 1
         """),
-        {
-            "provider": provider,
-            "model_id": model_id,
-            "author_id": user_id,
-        },
+        params,
     )
 
-    row = result.mappings().first()
-    pricing = dict(row) if row else None
+    rows = [dict(r) for r in result.mappings().all()]
 
-    cache[key] = pricing
-    return pricing
+    # Replicate the old ORDER BY (author_id IS NULL ? 0 : 1) ASC,
+    # effective_from DESC, LIMIT 1 semantics per (provider, model_id) group.
+    # Two stable sorts: effective_from DESC first, then rank ASC — Python's
+    # sort is stable, so the final order is rank primary, effective_from
+    # secondary, exactly matching the original single-row query per pair.
+    rows.sort(key=lambda r: r["effective_from"], reverse=True)
+    rows.sort(key=lambda r: 0 if r["author_id"] is None else 1)
+
+    best: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        key = (row["provider"], row["model_id"])
+        if key not in best:
+            best[key] = row
+
+    return {pair: best.get(pair) for pair in pair_list}
 
 
 # ───────────────────────────────────────────────────────────────
@@ -132,7 +144,19 @@ async def _fetch_db_rates(
 
 
 async def check_plan_limits(request: Request):
-    project = request.state.project
+    """
+    protects from non-project requests and blocked projects
+    """
+    project = getattr(request.state, "project", None)
+    if project in (None,""):
+        logger.error("unauthorized request: project not found in request state")
+        return HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "unauthorized",
+                "message": "Auth failed",
+            },
+        )
     if project["is_blocked"] == True:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -149,11 +173,9 @@ async def check_plan_limits(request: Request):
     tags=["costs"],
     dependencies=[Depends(check_plan_limits)],
 )
-@limiter.limit("1000/seconds")
 async def ingest_cost_event(
     request: Request,
     events: CostEventBatch,
-    db: AsyncSession = Depends(get_db),
     redis_client=Depends(get_redis),
 ):
     """
@@ -163,19 +185,58 @@ async def ingest_cost_event(
     returning 202. This endpoint no longer writes to PostgreSQL directly
     — a separate worker process consumes the stream and performs the
     durable insert. See workers/cost_event_worker.py.
+
+    Perf notes (see conversation history for the load-test diagnosis this
+    fixes):
+      - No more `db: AsyncSession = Depends(get_db)`. That tied a Postgres
+        connection's checkout to the entire request lifetime — including
+        the whole Redis loop below — even though the only DB work needed
+        is a single rate lookup taking milliseconds. Under load this held
+        connections open for 6-17s each instead of ms, exhausting the pool
+        long before Postgres's own max_connections math would predict.
+        A short-lived session is opened below just for that lookup.
+      - Rate lookup batched into ONE query for all distinct
+        (provider, model_id) pairs in the batch (see _fetch_db_rates_batch),
+        instead of one query per event.
+      - Cache-sync writes (apply_cost_to_cache) are queued onto a Redis
+        pipeline and flushed in a single round trip after the loop, instead
+        of being awaited one at a time per event.
+
+    ASSUMPTION FLAGGED: CostService.enqueue_event still receives the raw
+    redis_client and is still awaited per event below (its internals live
+    in services.py, which wasn't available to me). If it does its own
+    per-event SETNX/XADD round-trips, that's the next thing to pipeline —
+    share services.py to close that out. Also assumed CostService no longer
+    needs a DB session per the docstring above ("no longer writes to
+    PostgreSQL directly"); if that's wrong, CostService will need its own
+    explicitly-scoped session rather than reusing the rate_db one below,
+    which is closed before the loop runs.
     """
+    from ..sdk_api.pricing import infer_provider
+
     project_id = request.state.project_id
-    cost_svc = CostService(db)
-    counter = 0
-    rate_cache = {}
+    user_id = request.state.user_id
+
+    prepared = []
+    pairs: set[tuple[str, str]] = set()
     for ev in events.events:
-        from ..sdk_api.pricing import infer_provider
-        print(ev.event_id, ev.model, ev.provider, ev.tenant_id,"eve::::")
         provider = infer_provider(ev.model) or ev.provider or "unknown"
-        tenant_id = ev.tenant_id
-        db_rates = await _fetch_db_rates(
-            db, provider, ev.model, request.state.user_id, cache=rate_cache
-        )
+        pairs.add((provider, ev.model))
+        prepared.append((ev, provider))
+
+    # Short-lived session: alive only for this one batched query, then
+    # released back to the pool before any Redis work starts.
+    async with AsyncSessionLocal() as rate_db:
+        rates_by_pair = await _fetch_db_rates_batch(rate_db, pairs, user_id)
+
+    cost_svc = CostService(None)  # Redis-only path — see docstring note above
+
+    # Phase 0: pure computation (cost calc + payload prep), no Redis I/O.
+    # Kept as its own pass so the Redis work below can be batched instead
+    # of interleaved one-event-at-a-time with this loop.
+    costed: list[tuple] = []  # (ev, cost_usd) pairs, same order as `prepared`
+    for ev, provider in prepared:
+        db_rates = rates_by_pair.get((provider, ev.model))
         breakdown = calculate_cost(
             model=ev.model,
             input_tokens=ev.input_tokens,
@@ -196,8 +257,34 @@ async def ingest_cost_event(
             is_batch=getattr(ev, "is_batch", False),
             db_rates=db_rates,
         )
-        cost_usd = breakdown.total_cost
-        result = await cost_svc.enqueue_event(redis_client, project_id, ev, cost_usd)
+        costed.append((ev, breakdown.total_cost))
+
+    # Phase 1-3 (see CostService.enqueue_events_batch docstring): reserve
+    # dedup keys for the whole batch, XADD concurrently, close out TTL
+    # bookkeeping — all in ~3 Redis round trips total instead of up to
+    # 3*len(events) sequential ones. This replaces the old per-event
+    # `await cost_svc.enqueue_event(...)` loop, which was the actual
+    # throughput bottleneck under load (each event cost up to 3 sequential
+    # network round trips: SETNX, XADD, EXPIRE).
+    results = await cost_svc.enqueue_events_batch(redis_client, project_id, costed)
+
+    # Statuses that mean the event was actually queued durably (or already
+    # was, on a prior attempt) — only these should sync the live cost
+    # cache. Using an explicit allow-list here (rather than the previous
+    # `!= "duplicate_ignored"` deny-list) fixes a real bug: a rejected
+    # event (e.g. missing event_id, or a failed XADD) was previously still
+    # falling through to queue_apply_cost_to_cache, bumping the tenant's
+    # live budget cache for an event that was never durably recorded —
+    # a cache/ledger inconsistency that only gets worse the more ingest
+    # traffic comes from old SDKs or under Redis memory pressure.
+    QUEUED_STATUSES = {"accepted"}
+
+    cache_pipe = redis_client.pipeline(transaction=False)
+    pending_cache_writes = 0
+    counter = 0
+
+    for (ev, cost_usd), result in zip(costed, results):
+        tenant_id = ev.tenant_id
 
         # Keep any already-warm cost cache entries for this tenant/project in
         # sync, rather than invalidating them. This only updates the
@@ -209,14 +296,32 @@ async def ingest_cost_event(
         # worker falls behind — Redis is the source of truth for limits,
         # Postgres is the historical ledger.
         #
-        # Skipped entirely for duplicate_ignored events (see enqueue_event):
-        # the original attempt already incremented this cache, so a retry
-        # must not increment it again, or the tenant's live spend would be
-        # double-counted even though only one Postgres row ever lands.
-        if result["status"] != "duplicate_ignored":
-            await apply_cost_to_cache(redis_client, tenant_id, project_id, cost_usd)
+        # Skipped for duplicate_ignored (the original attempt already
+        # incremented this cache — a retry must not double-count it) and
+        # for anything rejected (never durably queued, so nothing to
+        # reflect in the live cache yet).
+        #
+        # Queued onto cache_pipe rather than awaited immediately — the
+        # whole batch's cache-sync writes get flushed in one round trip
+        # after the loop instead of up to 2*len(events) sequential ones.
+        if result["status"] in QUEUED_STATUSES:
+            queue_apply_cost_to_cache(cache_pipe, tenant_id, project_id, cost_usd)
+            pending_cache_writes += 1
 
         counter += 1
+
+    if pending_cache_writes:
+        try:
+            await cache_pipe.execute()
+        except Exception:
+            # Same soft-fail contract as the old per-call try/except inside
+            # _increment_cost_cache_if_exists: cache is a perf optimization,
+            # never a reason to fail ingestion.
+            logger.warning(
+                "failed to flush cost cache pipeline for project_id=%s",
+                project_id,
+                exc_info=True,
+            )
 
     return {"accepted": counter}
 
@@ -409,12 +514,48 @@ async def apply_cost_to_cache(
     traffic — this is a no-op; the next check-tenant-limit call will
     populate from the DB as normal, and that DB read already includes this
     event since it's written before this function is called.
+
+    Kept for any caller that wants an immediate, non-batched write (e.g.
+    a single event outside of /ingest's loop). For batches, use
+    queue_apply_cost_to_cache below instead — awaiting this per event is
+    exactly the sequential-round-trip pattern that made /ingest slow under
+    load.
     """
     daily_key = f"cost:daily:{tenant_id}:{project_id}"
     monthly_key = f"cost:monthly:{tenant_id}:{project_id}"
 
     await _increment_cost_cache_if_exists(redis_client, daily_key, cost_usd)
     await _increment_cost_cache_if_exists(redis_client, monthly_key, cost_usd)
+
+
+def queue_apply_cost_to_cache(
+    pipe,
+    tenant_id: str,
+    project_id: str,
+    cost_usd: float,
+    ttl: int = COST_CACHE_TTL,
+) -> None:
+    """
+    Pipelined sibling of apply_cost_to_cache: queues the daily + monthly
+    increment EVALs onto `pipe` (a redis pipeline, e.g. from
+    redis_client.pipeline(transaction=False)) instead of awaiting them.
+
+    Not a coroutine — redis-py's pipeline command methods just append to
+    the pipeline's internal command stack synchronously; nothing is sent
+    to Redis until the caller does `await pipe.execute()`. Call this once
+    per event in a batch, then execute() once after the loop — that's what
+    collapses up to 2*N sequential round trips into one.
+
+    Same semantics as apply_cost_to_cache/_increment_cost_cache_if_exists:
+    never creates a key, only bumps ones that already exist. See
+    _INCR_IF_EXISTS_LUA for why the existence-check + INCRBYFLOAT + EXPIRE
+    has to be a single atomic script rather than separate calls.
+    """
+    daily_key = f"cost:daily:{tenant_id}:{project_id}"
+    monthly_key = f"cost:monthly:{tenant_id}:{project_id}"
+
+    pipe.eval(_INCR_IF_EXISTS_LUA, 1, daily_key, str(cost_usd), str(ttl))
+    pipe.eval(_INCR_IF_EXISTS_LUA, 1, monthly_key, str(cost_usd), str(ttl))
 
 
 async def get_today_total_cost_cached(
@@ -472,7 +613,8 @@ async def _get_thresholds(
     # --------------------------------------------------------------------------------
     user_daily_threshold_result = await db.execute(
         select(Threshold).where(
-            Threshold.tenant_id == tenant_id, Threshold.frequency == Threshold.PER_DAY,
+            Threshold.tenant_id == tenant_id,
+            Threshold.frequency == Threshold.PER_DAY,
             Threshold.project_id == project_id,
         )
     )
@@ -483,7 +625,8 @@ async def _get_thresholds(
     # monthly
     user_monthly_threshold_result = await db.execute(
         select(Threshold).where(
-            Threshold.tenant_id == tenant_id, Threshold.frequency == Threshold.PER_MONTH,
+            Threshold.tenant_id == tenant_id,
+            Threshold.frequency == Threshold.PER_MONTH,
             Threshold.project_id == project_id,
         )
     )
@@ -500,7 +643,12 @@ async def _get_thresholds(
     return thresholds
 
 
-@router.get("/check-tenant-limit", status_code=200, tags=["check tenant limit"])
+@router.get(
+    "/check-tenant-limit",
+    status_code=200,
+    tags=["check tenant limit"],
+    dependencies=[Depends(check_plan_limits)],
+)
 @limiter.limit("1000/second")
 async def check_tenant_usage_limit(
     request: Request,
@@ -514,12 +662,9 @@ async def check_tenant_usage_limit(
 
     for t in thresholds:
         if t["frequency"] == Threshold.PER_DAY:
-            print("frequence per day..")
             cost_usd = await get_today_total_cost_cached(
                 db, redis_client, tenant_id, project_id
             )
-            print("cost usd this day", cost_usd)
-            print("threshold limit", t["limit_usd"])
             if cost_usd >= t["limit_usd"]:
                 limit_exceeded = True
         elif t["frequency"] == Threshold.PER_MONTH:
@@ -542,7 +687,12 @@ class SetThresholdRequest(BaseModel):
     frequency: str
 
 
-@router.post("/thresholds", status_code=200, tags=["thresholds"])
+@router.post(
+    "/thresholds",
+    status_code=200,
+    tags=["thresholds"],
+    dependencies=[Depends(check_plan_limits)],
+)
 async def set_threshold(
     request: Request,
     body: SetThresholdRequest,

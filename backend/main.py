@@ -105,6 +105,8 @@ BYPASS_PATHS = {
     "/health",
     "/auth/login",
     "/auth/register",
+    "/auth/resend-verification",
+    "/auth/verify-email",
 }
 
 NO_PROJECT_NEEDED_PATHS = {"/dashboard/create-project", "/dashboard/projects"}

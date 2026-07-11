@@ -24,7 +24,7 @@ PLANS: dict[str, Plan] = {
     "free": Plan(
         key="free",
         display_name="Free",
-        tracked_spend_limit_usd=500.0,
+        tracked_spend_limit_usd=100.0,
         monthly_price_usd=0.0,
         stripe_price_id_monthly=None,
         stripe_price_id_annual=None,
@@ -33,7 +33,7 @@ PLANS: dict[str, Plan] = {
     "starter": Plan(
         key="starter",
         display_name="Starter",
-        tracked_spend_limit_usd=5_000.0,
+        tracked_spend_limit_usd=3_000.0,
         monthly_price_usd=29.0,
         stripe_price_id_monthly=os.getenv("STRIPE_PRICE_STARTER_MONTHLY"),
         stripe_price_id_annual=os.getenv("STRIPE_PRICE_STARTER_ANNUAL"),
@@ -41,7 +41,7 @@ PLANS: dict[str, Plan] = {
     "growth": Plan(
         key="growth",
         display_name="Growth",
-        tracked_spend_limit_usd=25_000.0,
+        tracked_spend_limit_usd=10_000.0,
         monthly_price_usd=99.0,
         stripe_price_id_monthly=os.getenv("STRIPE_PRICE_GROWTH_MONTHLY"),
         stripe_price_id_annual=os.getenv("STRIPE_PRICE_GROWTH_ANNUAL"),
@@ -49,7 +49,7 @@ PLANS: dict[str, Plan] = {
     "scale": Plan(
         key="scale",
         display_name="Scale",
-        tracked_spend_limit_usd=100_000.0,
+        tracked_spend_limit_usd=50_000.0,
         monthly_price_usd=299.0,
         stripe_price_id_monthly=os.getenv("STRIPE_PRICE_SCALE_MONTHLY"),
         stripe_price_id_annual=os.getenv("STRIPE_PRICE_SCALE_ANNUAL"),

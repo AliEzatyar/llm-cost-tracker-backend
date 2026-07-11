@@ -2,32 +2,46 @@
 auth/router.py — Email + password authentication routes.
 
 Routes:
-  POST /auth/register   → create account
-  POST /auth/login      → exchange credentials for tokens
-  POST /auth/refresh    → swap a refresh token for a new access token
-  POST /auth/logout     → revoke the current refresh token
-  GET  /auth/me         → return the authenticated user's profile
-  POST /auth/change-password → update password (requires current password)
+  POST /auth/register           → create account, emails a 6-digit verification code
+  POST /auth/verify-email       → confirm an email address using {email, otp}
+  POST /auth/resend-verification → re-send a new verification code
+  POST /auth/login              → exchange credentials for tokens (requires verified email)
+  POST /auth/refresh            → swap a refresh token for a new access token
+  POST /auth/logout             → revoke the current refresh token
+  GET  /auth/me                 → return the authenticated user's profile
+  POST /auth/change-password    → update password (requires current password)
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Response, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Cookie,
+    Depends,
+    HTTPException,
+    Response,
+    status,
+)
 from pydantic import BaseModel, EmailStr, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database.database import get_db
 from backend.database.models import User
+from backend.emails.services import send_verification_email
 from .services import (
+    clear_email_otp,
     create_access_token,
     create_refresh_token,
     get_current_user,
     hash_password,
     revoke_refresh_token,
     rotate_refresh_token,
+    set_email_otp,
+    verify_email_otp,
     verify_password,
 )
 
@@ -53,6 +67,24 @@ class RegisterRequest(BaseModel):
         if not any(c.isupper() for c in v):
             raise ValueError("Password must contain at least one uppercase letter.")
         return v
+
+
+class RegisterResponse(BaseModel):
+    message: str
+    email: str
+
+
+class VerifyEmailRequest(BaseModel):
+    email: EmailStr
+    otp: str
+
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
+
+
+class MessageResponse(BaseModel):
+    message: str
 
 
 class LoginRequest(BaseModel):
@@ -125,16 +157,18 @@ def _clear_refresh_cookie(response: Response) -> None:
 
 
 @router.post(
-    "/register", status_code=status.HTTP_201_CREATED, response_model=TokenResponse
+    "/register", status_code=status.HTTP_201_CREATED, response_model=RegisterResponse
 )
 async def register(
     body: RegisterRequest,
-    response: Response,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     """
     Create a new user account.
-    Returns an access token immediately; also sets an HttpOnly refresh token cookie.
+
+    The account starts unverified. No tokens are issued here — the user must
+    verify their email (see /auth/verify-email) before they can log in.
     """
     # Check uniqueness
     existing = await db.execute(select(User).where(User.email == body.email))
@@ -149,13 +183,77 @@ async def register(
         hashed_password=hash_password(body.password),
     )
     db.add(user)
-    await db.flush()  # get user.id before creating the refresh token
+    await db.flush()  # get user.id before generating the OTP
 
-    access_token = create_access_token(user.id, user.email)
-    raw_refresh = await create_refresh_token(user.id, db)
-    _set_refresh_cookie(response, raw_refresh)
+    otp = await set_email_otp(user, db)
+    background_tasks.add_task(send_verification_email, user.email, otp)
 
-    return TokenResponse(access_token=access_token)
+    return RegisterResponse(
+        message="Account created. Check your email for a verification code.",
+        email=user.email,
+    )
+
+
+# ── POST /auth/verify-email ───────────────────────────────────────────────────
+
+
+@router.post("/verify-email", response_model=MessageResponse)
+async def verify_email(
+    body: VerifyEmailRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Confirm a user's email address with the 6-digit code sent by
+    /auth/register or /auth/resend-verification."""
+    result = await db.execute(select(User).where(User.email == body.email))
+    user = result.scalar_one_or_none()
+
+    invalid = HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Invalid or expired code.",
+    )
+
+    if not user:
+        raise invalid
+
+    if user.is_verified:
+        return MessageResponse(message="Email already verified. You can log in.")
+
+    if not verify_email_otp(user, body.otp):
+        raise invalid
+
+    user.is_verified = True
+    clear_email_otp(user)
+
+    return MessageResponse(message="Email verified. You can now log in.")
+
+
+# ── POST /auth/resend-verification ────────────────────────────────────────────
+
+
+@router.post("/resend-verification", response_model=MessageResponse)
+async def resend_verification(
+    body: ResendVerificationRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Re-send a fresh verification code.
+
+    Always returns the same generic message regardless of whether the email
+    exists or is already verified, to avoid leaking account existence.
+    """
+    generic_response = MessageResponse(
+        message="If that email exists and isn't verified yet, we've sent a new code."
+    )
+
+    result = await db.execute(select(User).where(User.email == body.email))
+    user = result.scalar_one_or_none()
+
+    if user and not user.is_verified:
+        otp = await set_email_otp(user, db)
+        background_tasks.add_task(send_verification_email, user.email, otp)
+
+    return generic_response
 
 
 # ── POST /auth/login ──────────────────────────────────────────────────────────
@@ -189,6 +287,11 @@ async def login(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is deactivated.",
+        )
+    if not user.is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Please verify your email address before logging in.",
         )
 
     # Update last_login timestamp
@@ -261,7 +364,7 @@ async def logout(
 @router.get("/me", response_model=UserProfile)
 async def me(current_user: User = Depends(get_current_user)):
     """Return the authenticated user's profile."""
-    
+
     return UserProfile(
         is_admin=current_user.is_admin,
         id=str(current_user.id),
