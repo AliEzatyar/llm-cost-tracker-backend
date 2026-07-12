@@ -1,27 +1,14 @@
 """
-backend/emails/service.py — Generic transactional email sender (AWS SES via boto3).
+backend/emails/service.py — Generic transactional email sender (Resend).
 
 This module is intentionally standalone (no imports from `auth`) so any part of
-the backend can send emails: `from backend.emails.service import send_email`.
+the backend can send emails.
 
-Usage:
-    from backend.emails.service import send_email
-    send_email(to="user@example.com", subject="Hi", html_body="<p>Hello</p>")
+Environment variables:
 
-For a specific, recurring email (verification, password reset, receipts, ...),
-add a small wrapper function below (see send_verification_email) so callers
-never have to build the subject/body themselves.
-
-Environment variables (set these in .env):
-  AWS_ACCESS_KEY_ID       — IAM access key with ses:SendEmail permission
-  AWS_SECRET_ACCESS_KEY   — corresponding secret key
-  AWS_REGION              — region your SES identity lives in, e.g. "eu-west-1" (default: us-east-1)
-  SES_SENDER_EMAIL        — a verified SES sender identity, e.g. "no-reply@yourapp.com"
-  FRONTEND_URL            — base URL of your frontend, used to build links in emails, e.g. "https://app.yourapp.com"
-
-Note: while your SES account is in the sandbox, you can only send TO addresses
-that are also verified in SES. Request production access in the SES console
-to send to arbitrary recipients.
+RESEND_API_KEY      — Your Resend API key
+EMAIL_FROM          — Verified sender address, e.g. "Token Limit <noreply@token-limit.com>"
+FRONTEND_URL        — Frontend URL
 """
 
 from __future__ import annotations
@@ -29,30 +16,19 @@ from __future__ import annotations
 import logging
 import os
 from typing import Optional
+from html import escape
+from urllib.parse import quote
 
-import boto3
-from botocore.exceptions import BotoCoreError, ClientError
+import resend
 
 logger = logging.getLogger(__name__)
 
-AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
-SES_SENDER_EMAIL: Optional[str] = os.getenv("SES_SENDER_EMAIL")
+RESEND_API_KEY: Optional[str] = os.getenv("RESEND_API_KEY")
+EMAIL_FROM: Optional[str] = os.getenv("EMAIL_FROM")
 FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
-_ses_client = None
-
-
-def _get_client():
-    """Lazily create a single boto3 SES client and reuse it across calls."""
-    global _ses_client
-    if _ses_client is None:
-        _ses_client = boto3.client(
-            "ses",
-            region_name=AWS_REGION,
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        )
-    return _ses_client
+if RESEND_API_KEY:
+    resend.api_key = RESEND_API_KEY
 
 
 def send_email(
@@ -63,73 +39,218 @@ def send_email(
     sender: Optional[str] = None,
 ) -> bool:
     """
-    Send a single transactional email via AWS SES.
+    Send a transactional email via Resend.
 
-    Returns True on success, False on failure. Never raises — a flaky email
-    provider should not turn into a 500 for the caller's request. Callers that
-    care whether the email actually went out (e.g. to warn an admin) can check
-    the return value; callers that don't (most routes) can fire-and-forget via
-    FastAPI's BackgroundTasks.
+    Returns True on success, False on failure.
+    Never raises exceptions to callers.
     """
-    if not (sender or SES_SENDER_EMAIL):
-        logger.error("SES_SENDER_EMAIL is not configured; cannot send email to %s", to)
+
+    from_email = sender or EMAIL_FROM
+
+    if not RESEND_API_KEY:
+        logger.error("RESEND_API_KEY is not configured.")
         return False
 
-    body: dict = {"Html": {"Data": html_body, "Charset": "UTF-8"}}
+    if not from_email:
+        logger.error("EMAIL_FROM is not configured.")
+        return False
+
+    params = {
+        "from": from_email,
+        "to": [to],
+        "subject": subject,
+        "html": html_body,
+    }
+
     if text_body:
-        body["Text"] = {"Data": text_body, "Charset": "UTF-8"}
+        params["text"] = text_body
 
     try:
-        _get_client().send_email(
-            Source=sender or SES_SENDER_EMAIL,
-            Destination={"ToAddresses": [to]},
-            Message={
-                "Subject": {"Data": subject, "Charset": "UTF-8"},
-                "Body": body,
-            },
-        )
-        logger.info("Sent email to %s (subject=%r)", to, subject)
+        resend.Emails.send(params)
+        logger.info("Email sent successfully to %s (%s)", to, subject)
         return True
-    except (ClientError, BotoCoreError) as exc:
-        logger.error("Failed to send email to %s: %s", to, exc)
+
+    except Exception:
+        logger.exception("Email delivery failed for %s", to)
         return False
 
 
-# ---------------------------------------------------------------------------
-# Templated emails — one small function per email "type" the app sends.
-# Routers/services call these instead of touching boto3 or building HTML.
-# ---------------------------------------------------------------------------
+def email_template(content: str) -> str:
+    """
+    Shared email layout.
+    """
+
+    return f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Token Limit</title>
+
+<style>
+body {{
+    margin:0;
+    padding:0;
+    background:#f6f8fb;
+    font-family:Arial, Helvetica, sans-serif;
+    color:#111827;
+}}
+
+.container {{
+    max-width:600px;
+    margin:40px auto;
+    background:#ffffff;
+    border-radius:12px;
+    padding:32px;
+    box-shadow:0 2px 8px rgba(0,0,0,0.05);
+}}
+
+.logo {{
+    font-size:36px;
+    font-weight:700;
+    margin-bottom:24px;
+}}
+
+.footer {{
+    margin-top:32px;
+    color:#6b7280;
+    font-size:13px;
+    line-height:20px;
+}}
+
+.button {{
+    display:inline-block;
+    background:#111827;
+    color:#ffffff !important;
+    padding:12px 22px;
+    border-radius:8px;
+    text-decoration:none;
+    font-weight:600;
+}}
+
+.code {{
+    background:#f3f4f6;
+    padding:16px;
+    border-radius:10px;
+    font-size:30px;
+    font-weight:700;
+    letter-spacing:8px;
+    text-align:center;
+    margin:24px 0;
+}}
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+<div class="logo">
+TokenLimit
+</div>
+
+{content}
+
+<div class="footer">
+This email was sent by Token Limit.<br>
+If you did not request this action, you can safely ignore this email.
+</div>
+
+</div>
+
+</body>
+</html>
+"""
 
 
 def send_verification_email(to: str, otp: str) -> bool:
-    """Sent right after registration (or on resend): a 6-digit code the user
-    types into the app to confirm their email address."""
-    subject = "Your verification code"
-    html_body = f"""
-    <p>Use this code to verify your email address:</p>
-    <p style="font-size:28px; font-weight:700; letter-spacing:6px; margin:16px 0;">{otp}</p>
-    <p>This code expires in 10 minutes. If you didn't create an account, you can ignore this email.</p>
-    """
-    text_body = (
-        f"Your verification code is: {otp}\n\n"
-        "This code expires in 10 minutes. If you didn't create an account, you can ignore this email."
+
+    otp = escape(otp)
+
+    subject = "Verify your Token Limit account"
+
+    html_body = email_template(f"""
+<p>
+Welcome to Token Limit.
+</p>
+
+<p>
+Use the verification code below to confirm your email address:
+</p>
+
+<div class="code">
+{otp}
+</div>
+
+<p>
+This code expires in <strong>10 minutes</strong>.
+</p>
+""")
+
+    text_body = f"""
+Welcome to Token Limit.
+
+Your verification code is:
+
+{otp}
+
+This code expires in 10 minutes.
+
+If you did not create an account, you can ignore this email.
+"""
+
+    return send_email(
+        to=to,
+        subject=subject,
+        html_body=html_body,
+        text_body=text_body.strip(),
     )
-    return send_email(to, subject, html_body, text_body)
 
 
 def send_password_reset_email(to: str, token: str) -> bool:
-    """Example second email type — copy this pattern for anything else you
-    need to send (receipts, invites, digest emails, ...)."""
-    link = f"{FRONTEND_URL}/reset-password?token={token}"
-    subject = "Reset your password"
-    html_body = f"""
-    <p>We received a request to reset your password.</p>
-    <p><a href="{link}">Reset my password</a></p>
-    <p>If you didn't request this, you can safely ignore this email.</p>
-    """
-    text_body = (
-        "We received a request to reset your password.\n\n"
-        f"{link}\n\n"
-        "If you didn't request this, you can safely ignore this email."
+
+    safe_token = quote(token)
+
+    link = f"{FRONTEND_URL}/reset-password?token={safe_token}"
+
+    subject = "Reset your Token Limit password"
+
+    html_body = email_template(f"""
+<p>
+We received a request to reset your Token Limit password.
+</p>
+
+<p>
+Click the button below to choose a new password:
+</p>
+
+<p>
+<a class="button" href="{link}">
+Reset Password
+</a>
+</p>
+
+<p>
+This link expires according to your account security settings.
+</p>
+""")
+
+    text_body = f"""
+We received a request to reset your Token Limit password.
+
+Reset your password here:
+
+{link}
+
+If you did not request this, you can safely ignore this email.
+"""
+
+    return send_email(
+        to=to,
+        subject=subject,
+        html_body=html_body,
+        text_body=text_body.strip(),
     )
-    return send_email(to, subject, html_body, text_body)

@@ -61,7 +61,7 @@ async def job_check_thresholds() -> None:
     Inserts an alert row and fires email + webhook for any new breach.
     Skips customers that already received an alert in the last hour.
     """
-    logger.info("[worker] job_check_thresholds: starting")
+    # logger.info("[worker] job_check_thresholds: starting")
     try:
         async with AsyncSessionLocal() as session:
             alert_svc = AlertService(session)
@@ -92,14 +92,14 @@ async def job_rollup_daily() -> None:
     Aggregates yesterday's raw cost_events rows into customer_cost_daily
     using an UPSERT so re-runs are idempotent.
     """
-    logger.info("[worker] job_rollup_daily: starting")
+    # logger.info("[worker] job_rollup_daily: starting")
     try:
         async with AsyncSessionLocal() as session:
             cost_svc = CostService(session)
             upserted = await cost_svc.rollup_daily()  # rolls up ALL projects
             await session.commit()
 
-        logger.info("[worker] job_rollup_daily: %d row(s) upserted", upserted)
+        # logger.info("[worker] job_rollup_daily: %d row(s) upserted", upserted)
 
     except Exception:
         logger.exception("[worker] job_rollup_daily: unhandled error")
@@ -121,7 +121,7 @@ async def job_sync_model_pricing() -> None:
         1. Create a `model_pricing` table with (model, input_usd, output_usd, updated_at).
         2. Replace the stub below with a real fetch + upsert.
     """
-    logger.info("[worker] job_sync_model_pricing: stub — implement pricing sync here")
+    # logger.info("[worker] job_sync_model_pricing: stub — implement pricing sync here")
 
     # Example skeleton:
     # async with httpx.AsyncClient() as client:
@@ -173,12 +173,12 @@ async def sync_all_projects(session_factory: async_sessionmaker) -> None:
                     period_start=period_start,
                     period_end=period_end,
                 )
-                logger.info(
-                    "Synced project=%s plan=%s spend=$%.4f",
-                    sub.project_id,
-                    sub.plan,
-                    total,
-                )
+                # logger.info(
+                #     "Synced project=%s plan=%s spend=$%.4f",
+                #     sub.project_id,
+                #     sub.plan,
+                #     total,
+                # )
             except Exception:
                 logger.exception("Failed to sync project=%s", sub.project_id)
 
@@ -204,12 +204,12 @@ async def sync_free_projects_usage(session_factory: async_sessionmaker) -> None:
                         period_start=period_start,
                         period_end=period_end,
                     )
-                    logger.info(
-                        "Synced project=%s plan=%s spend=$%.4f",
-                        project.id,
-                        project.plan,
-                        total,
-                    )
+                    # logger.info(
+                    #     "Synced project=%s plan=%s spend=$%.4f",
+                    #     project.id,
+                    #     project.plan,
+                    #     total,
+                    # )
                 except Exception:
                     logger.exception("Failed to sync project=%s", project.id)
 

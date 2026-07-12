@@ -1,5 +1,6 @@
 import asyncio
 from logging.config import fileConfig
+import os
 from sqlalchemy.ext.asyncio import async_engine_from_config
 from sqlalchemy import pool
 from alembic import context
@@ -7,8 +8,16 @@ from alembic import context
 # Import ALL your models so Alembic can see them
 from backend.database.models import Base
 from backend.database import models  # ensures all model classes are registered
-
 config = context.config
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+database_url = os.getenv("DATABASE_URL")
+if database_url:
+    config.set_main_option("sqlalchemy.url", database_url)
+
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
